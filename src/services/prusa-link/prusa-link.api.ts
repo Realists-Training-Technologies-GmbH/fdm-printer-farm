@@ -212,6 +212,10 @@ export class PrusaLinkApi implements IPrinterApi {
   async uploadFile(input: UploadFileInput): Promise<void> {
     const validated = uploadFileInputSchema.parse(input);
 
+    // Prime the digest-auth nonce with a no-body request so the upload PUT below
+    // doesn't trigger a 401 retry that would silently send an empty stream body.
+    await this.getVersion();
+
     try {
       const response = await this.createClient((b) => {
         b.withHeaders({

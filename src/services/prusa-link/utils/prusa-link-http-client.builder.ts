@@ -6,6 +6,7 @@ import {
 import { AxiosError, AxiosInstance, AxiosRequestConfig } from "axios";
 import { generateDigestAuthHeader } from "./digest-auth.util";
 import { randomBytes } from "node:crypto";
+import { Readable } from "node:stream";
 
 export interface DigestAuthInfo {
   realm: string;
@@ -67,6 +68,14 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
               }
 
               this.saveParsedAuthHeaderContext(wwwAuthHeader);
+
+              // A Readable body cannot be replayed — retrying would send an empty body and
+              // silently corrupt the upload. Surface the 401 so callers can refresh auth
+              // (e.g. with a no-body request) and retry from a fresh stream themselves.
+              if (originalRequest.data instanceof Readable) {
+                return Promise.reject(error);
+              }
+
               originalRequest._retryCount = (originalRequest._retryCount ?? 0) + 1;
 
               if (typeof this.onRequestRetry === "function") {
