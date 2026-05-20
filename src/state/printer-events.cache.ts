@@ -242,7 +242,14 @@ export class PrinterEventsCache extends KeyDiffCache<PrinterEventsCacheDto> {
       const stateText: string | undefined = payload?.state?.text;
       const stateUpper = stateText?.toUpperCase() ?? "";
       const flags = payload?.state?.flags;
-      const filename = payload?.job?.file?.path ?? payload?.job?.file?.display;
+      // Prefer the long display name over the firmware's short DOS-style
+      // path so the PrintJob row gets stored as "WIRBEL_TESTPART.BGC"
+      // instead of the unfriendly "/usb/PRODUK~1/.../WIRBEL~1/3XAT9_~1.BGC"
+      // that Buddy returns in `file.path`. All subsequent
+      // markStarted / markProgress / markFinished calls in this handler
+      // use the same `filename`, so they stay consistent.
+      const filename =
+        payload?.job?.file?.display ?? payload?.job?.file?.name ?? payload?.job?.file?.path;
       const completion = payload?.progress?.completion;
       if (stateUpper === "PRINTING" && filename) {
         const printerName = await this.getPrinterName(printerId);
