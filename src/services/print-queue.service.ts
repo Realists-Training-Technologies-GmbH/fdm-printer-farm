@@ -11,6 +11,8 @@ import { PrinterSocketStore } from "@/state/printer-socket.store";
 import { SOCKET_STATE } from "@/shared/dtos/socket-state.type";
 import { API_STATE } from "@/shared/dtos/api-state.type";
 import { captureException } from "@sentry/node";
+import { PrinterMaintenanceLogService } from "@/services/orm/printer-maintenance-log.service";
+import { BadRequestException } from "@/exceptions/runtime.exceptions";
 
 export interface QueuedJob {
   id: number;
@@ -56,6 +58,7 @@ export class PrintQueueService implements IPrintQueueService {
     private readonly printerApiFactory: PrinterApiFactory,
     private readonly fileStorageService: FileStorageService,
     private readonly printerSocketStore: PrinterSocketStore,
+    private readonly printerMaintenanceLogService: PrinterMaintenanceLogService,
   ) {
     this.printJobRepository = typeormService.getDataSource().getRepository(PrintJob);
     this.printerRepository = typeormService.getDataSource().getRepository(Printer);
@@ -113,6 +116,7 @@ export class PrintQueueService implements IPrintQueueService {
     }
 
     this.ensurePrinterAssignment(job, printerId);
+    await this.ensurePrinterNotInMaintenance(printerId);
 
     if (position === undefined || position === null) {
       const maxPosition = await this.getMaxQueuePosition(printerId);
@@ -257,6 +261,15 @@ export class PrintQueueService implements IPrintQueueService {
     return nextJob;
   }
 
+  private async ensurePrinterNotInMaintenance(printerId: number): Promise<void> {
+    const inMaintenance = await this.printerMaintenanceLogService.hasActiveByPrinterId(printerId);
+    if (inMaintenance) {
+      throw new BadRequestException(
+        `Printer ${printerId} has pending maintenance and cannot accept print jobs. Complete the maintenance first.`,
+      );
+    }
+  }
+
   private ensurePrinterAssignment(job: PrintJob, printerId: number): void {
     if (!job.printerId) {
       job.printerId = printerId;
@@ -303,6 +316,7 @@ export class PrintQueueService implements IPrintQueueService {
     }
 
     this.ensurePrinterAssignment(job, printerId);
+    await this.ensurePrinterNotInMaintenance(printerId);
 
     const queuePosition = job.queuePosition;
     if (job.queuePosition !== null) {

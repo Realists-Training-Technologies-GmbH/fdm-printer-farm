@@ -65,6 +65,9 @@ export interface FileDto {
   size: number | null;
   date: number | null;
   dir: boolean;
+  // Optional human-readable name when the addressable path is a constrained
+  // shortname (e.g. PrusaLink/FAT 8.3 truncations like `1XAT6-~1.BGC`).
+  displayName?: string | null;
 }
 
 export interface FilesDto {

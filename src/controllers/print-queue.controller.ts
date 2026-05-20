@@ -15,6 +15,7 @@ import type { FileFormatType } from "@/entities/print-job.entity";
 import { PrusaLinkType, type PrinterType } from "@/services/printer-api.interface";
 import { getIncompatibilityReason } from "@/utils/printer-compatibility.util";
 import { PrinterFirmwareCache } from "@/state/printer-firmware.cache";
+import { PrinterMaintenanceLogService } from "@/services/orm/printer-maintenance-log.service";
 
 @route(AppConstants.apiRoute + "/print-queue")
 @before([authenticate(), authorizeRoles([ROLES.ADMIN, ROLES.OPERATOR])])
@@ -28,6 +29,7 @@ export class PrintQueueController {
     private readonly fileStorageService: FileStorageService,
     private readonly printerCache: PrinterCache,
     private readonly printerFirmwareCache: PrinterFirmwareCache,
+    private readonly printerMaintenanceLogService: PrinterMaintenanceLogService,
   ) {
     this.logger = loggerFactory(PrintQueueController.name);
   }
@@ -131,7 +133,19 @@ export class PrintQueueController {
         );
       }
 
+      const maintenancePrinterIds = await this.printerMaintenanceLogService.getActivePrinterIdsSet(
+        allPrinters.map((p) => p.id),
+      );
+
       const enriched = allPrinters.map((printer) => {
+        if (maintenancePrinterIds.has(printer.id)) {
+          return {
+            printer,
+            compatible: false,
+            reason: "Printer has pending maintenance and is not ready to print. Complete the maintenance first.",
+          };
+        }
+
         const typeReason = getIncompatibilityReason(printer.printerType as PrinterType, fileFormat);
         if (typeReason) {
           return { printer, compatible: false, reason: typeReason };
@@ -370,6 +384,15 @@ export class PrintQueueController {
       }
 
       const printer = await this.printerCache.getCachedPrinterOrThrowAsync(printerId);
+
+      const inMaintenance = await this.printerMaintenanceLogService.hasActiveByPrinterId(printerId);
+      if (inMaintenance) {
+        res.status(400).send({
+          error: "Printer has pending maintenance",
+          message: `Printer ${printer.name} has pending maintenance and cannot accept print jobs. Complete the maintenance first.`,
+        });
+        return;
+      }
 
       // Defence in depth: even if a stale UI lets the user pick an incompatible
       // printer, refuse server-side so we don't queue a file the printer can't

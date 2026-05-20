@@ -89,20 +89,17 @@ export class PrusaLinkApi implements IPrinterApi {
     // Buddy firmware it intermittently reports `children: []` for the USB folder
     // even when files are physically present on the stick.
     //
-    // `startDir` may arrive as "/usb", "/usb/", "usb/FORSCH~1", "FORSCH~1",
-    // "FORSCH~1/sub/dir", etc. Normalize to a path under the storage root.
+    // `startDir` may arrive as "/usb", "/usb/", "usb/Produktion",
+    // "Produktion/SubFolder", etc. Segments are user-facing (`display_name`),
+    // not the FAT 8.3 short names PrusaLink stores them under, so we resolve
+    // each segment back to its short name before talking to the firmware.
     const trimmed = (startDir ?? "").replace(/^\/+|\/+$/g, "");
     const storageMatch = trimmed.match(/^(usb|local)(?:\/(.+))?$/i);
     const storage = (storageMatch?.[1] ?? "usb").toLowerCase();
     const relPath = storageMatch ? (storageMatch[2] ?? "") : trimmed;
-    const encodedRel = relPath
-      .split("/")
-      .filter(Boolean)
-      .map(encodeURIComponent)
-      .join("/");
-    const url = encodedRel ? `/api/v1/files/${storage}/${encodedRel}` : `/api/v1/files/${storage}`;
 
-    const response = await this.client.get<{
+    // Try the path as-is (LFN) first — see `resolveEncodedPath` for the rationale.
+    type ListingResponse = {
       name?: string;
       type?: string;
       children?: Array<{
@@ -113,34 +110,165 @@ export class PrusaLinkApi implements IPrinterApi {
         m_timestamp?: number;
         refs?: { download?: string };
       }>;
-    }>(url);
+    };
+
+    const encodeSegments = (p: string) =>
+      p.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    // `/api/v1/files/{storage}` paginates and returns a small default page
+    // (10 items on current Buddy firmware), which silently hides folders past
+    // the first page. Ask for a large window — the firmware caps at its
+    // internal max, so over-asking is safe.
+    const listingQuery = "?offset=0&limit=1000";
+    const buildUrl = (encoded: string) =>
+      encoded
+        ? `/api/v1/files/${storage}/${encoded}${listingQuery}`
+        : `/api/v1/files/${storage}${listingQuery}`;
+
+    const directEncoded = encodeSegments(relPath);
+    let response;
+    let resolvedEncodedParent = directEncoded;
+    try {
+      response = await this.client.get<ListingResponse>(buildUrl(directEncoded));
+    } catch {
+      const shortRel = await this.resolveStoragePath(relPath, storage);
+      resolvedEncodedParent = encodeSegments(shortRel);
+      response = await this.client.get<ListingResponse>(buildUrl(resolvedEncodedParent));
+    }
 
     const children = response.data?.children ?? [];
+    // The user navigated into `relPath` using display names, so build the
+    // prefix from those (not the resolved short names) — otherwise a click
+    // on `Produktion/subfile` would return as `PRODUK~1/...` and round-trip
+    // wouldn't show the long folder name to the user anymore.
     const dirPrefix = relPath ? `${relPath.replace(/\/+$/, "")}/` : "";
 
-    const items = children.map((child) => ({
-      // Return the path relative to the storage root so downstream endpoints
-      // (startPrint/downloadFile/deleteFile) can prepend `/api/v1/files/usb/`.
-      path: `${dirPrefix}${child.name}`,
-      size: child.size ?? null,
-      date: child.m_timestamp ?? null,
-      dir: (child.type ?? "").toUpperCase() === "FOLDER",
-    }));
+    const baseItems = children.map((child) => {
+      const dir = (child.type ?? "").toUpperCase() === "FOLDER";
+      // Surface the long display name in `path` so the frontend (which
+      // renders `path` directly) shows "Produktion" instead of "PRODUK~1".
+      // We resolve back to the short name on every operation below.
+      const visibleName = child.display_name ?? child.name;
+      return {
+        path: `${dirPrefix}${visibleName}`,
+        size: child.size ?? null,
+        date: child.m_timestamp ?? null,
+        dir,
+        displayName: child.display_name ?? null,
+      };
+    });
+
+    // PrusaLink's folder listings don't include `size` for child files (only
+    // the individual `/api/v1/files/usb/<path>` endpoint does). Fetch sizes
+    // in parallel for the files that are missing one. Cap to a reasonable
+    // batch so a huge folder doesn't fan out into thousands of requests.
+    const sizeFetchCap = 64;
+    const missingSize = baseItems
+      .filter((i) => !i.dir && i.size === null)
+      .slice(0, sizeFetchCap);
+    if (missingSize.length > 0) {
+      const sizes = await Promise.all(
+        children
+          .filter((c) => (c.type ?? "").toUpperCase() !== "FOLDER" && c.size == null)
+          .slice(0, sizeFetchCap)
+          .map((c) => {
+            const encodedChild = resolvedEncodedParent
+              ? `${resolvedEncodedParent}/${encodeURIComponent(c.name)}`
+              : encodeURIComponent(c.name);
+            return this.getFileRaw(encodedChild)
+              .then((r) => r.data?.size ?? null)
+              .catch(() => null);
+          }),
+      );
+      missingSize.forEach((item, idx) => {
+        item.size = sizes[idx];
+      });
+    }
 
     return {
-      dirs: items.filter((i) => i.dir),
-      files: items.filter((i) => !i.dir),
+      dirs: baseItems.filter((i) => i.dir),
+      files: baseItems.filter((i) => !i.dir),
     };
   }
 
+  /**
+   * Walk a user-facing path (which may contain `display_name` segments like
+   * "Produktion/file.bgcode") and resolve it to the printer's actual FAT path
+   * (short names like "PRODUK~1/FILE~1.BGC") by listing each parent and
+   * matching by `display_name` first, then by `name`.
+   *
+   * The input may arrive URL-encoded (it does when called from controllers
+   * that already encode for the printer API). Each segment is decoded before
+   * matching.
+   */
+  private async resolveStoragePath(userPath: string, storage = "usb"): Promise<string> {
+    if (!userPath) return "";
+    const segments = userPath
+      .split("/")
+      .filter(Boolean)
+      .map((s) => {
+        try {
+          return decodeURIComponent(s);
+        } catch {
+          return s;
+        }
+      });
+
+    const resolved: string[] = [];
+    for (const segment of segments) {
+      const parentEncoded = resolved.map(encodeURIComponent).join("/");
+      const url = parentEncoded
+        ? `/api/v1/files/${storage}/${parentEncoded}?offset=0&limit=1000`
+        : `/api/v1/files/${storage}?offset=0&limit=1000`;
+
+      try {
+        const response = await this.client.get<{
+          children?: Array<{ name: string; display_name?: string }>;
+        }>(url);
+        const match = response.data?.children?.find(
+          (c) => c.display_name === segment || c.name === segment,
+        );
+        resolved.push(match?.name ?? segment);
+      } catch {
+        // If the parent isn't listable for any reason, fall back to the user
+        // segment — at worst the downstream call gets a 404 instead of a
+        // silent mis-resolution.
+        resolved.push(segment);
+      }
+    }
+
+    return resolved.join("/");
+  }
+
+  /** Resolve an already-encoded user path to an encoded FAT short-name path. */
+  private async resolveEncodedPath(encodedPath: string, storage = "usb"): Promise<string> {
+    if (!encodedPath) return encodedPath;
+
+    // Optimistically try the path as-is — Buddy firmware's FatFS LFN support
+    // means a long display-name path like "Forschung/AT10/Tool/file.bgcode"
+    // is usually resolved without any per-segment walk. This collapses the
+    // entire pre-download chatter into a single probe, which is critical
+    // when the printer's HTTP server is slow (digest-auth dance per request).
+    try {
+      await this.client.get(`/api/v1/files/${storage}/${encodedPath}`);
+      return encodedPath;
+    } catch {
+      // Fall back to segment-by-segment resolution against display_name.
+    }
+
+    const shortPath = await this.resolveStoragePath(encodedPath, storage);
+    return shortPath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  }
+
   async getFile(path: string): Promise<FileDto> {
-    const response = await this.getFileRaw(path);
+    const resolved = await this.resolveEncodedPath(path);
+    const response = await this.getFileRaw(resolved);
 
     return {
-      path: response.data.name,
+      path: response.data.display_name ?? response.data.name,
       size: response.data.size,
-      date: null,
+      date: response.data.m_timestamp ?? null,
       dir: false,
+      displayName: response.data.display_name ?? null,
     };
   }
 
@@ -182,7 +310,8 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async startPrint(path: string): Promise<void> {
-    await this.client.post<void>(`/api/v1/files/usb/${path}`);
+    const resolved = await this.resolveEncodedPath(path);
+    await this.client.post<void>(`/api/v1/files/usb/${resolved}`);
   }
 
   async pausePrint(): Promise<void> {
@@ -229,16 +358,40 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async downloadFile(path: string): AxiosPromise<NodeJS.ReadableStream> {
-    const fileReference = await this.getFileRaw(path);
+    // Try the LFN path directly. Only walk segment-by-segment if the firmware
+    // rejects with 404 (which it shouldn't, since Buddy resolves LFN, but the
+    // fallback is here as insurance for older firmware).
+    let fileReference;
+    try {
+      fileReference = await this.getFileRaw(path);
+    } catch (e: any) {
+      if (e?.response?.status !== 404) throw e;
+      const shortPath = await this.resolveStoragePath(path);
+      const encoded = shortPath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+      fileReference = await this.getFileRaw(encoded);
+    }
     const pathUrl = fileReference.data.refs.download;
+    const displayName = fileReference.data.display_name;
 
-    return await this.client.get(pathUrl, {
+    const response = await this.client.get(pathUrl, {
       responseType: "stream",
     });
+
+    // The FAT filesystem on the printer's USB stick stores files under
+    // 8.3 short names (e.g. `1XAT6-~1.BGC`), and PrusaLink's download response
+    // sets Content-Disposition with that shortened name. Replace it with the
+    // long display name so browsers save the file with its original filename.
+    if (displayName) {
+      const safe = displayName.replace(/"/g, "");
+      response.headers["content-disposition"] = `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(displayName)}`;
+    }
+
+    return response;
   }
 
   async getFileChunk(path: string, startBytes: number, endBytes: number): AxiosPromise<string> {
-    const fileReference = await this.getFileRaw(path);
+    const resolved = await this.resolveEncodedPath(path);
+    const fileReference = await this.getFileRaw(resolved);
     const pathUrl = fileReference.data.refs.download;
 
     return await this.createClient((o) =>
@@ -324,11 +477,13 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async deleteFile(path: string): Promise<void> {
-    await this.client.delete<void>(`/api/v1/files/usb/${path}`);
+    const resolved = await this.resolveEncodedPath(path);
+    await this.client.delete<void>(`/api/v1/files/usb/${resolved}`);
   }
 
   async deleteFolder(path: string): Promise<void> {
-    await this.client.delete<void>(`/api/v1/files/usb/${path}`);
+    const resolved = await this.resolveEncodedPath(path);
+    await this.client.delete<void>(`/api/v1/files/usb/${resolved}`);
   }
 
   getSettings(): Promise<ServerConfigDto | SettingsDto> {

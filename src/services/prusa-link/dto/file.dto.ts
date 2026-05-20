@@ -15,6 +15,11 @@ export interface PL_FileDto {
   origin: string; // local
   size: number;
   refs: RefsDto;
+  // PrusaLink (modern `/api/v1/files/usb/<path>`) returns the long original
+  // filename here; `name` itself is the FAT 8.3 short name.
+  display_name?: string;
+  m_timestamp?: number;
+  type?: string;
 }
 
 export interface ChildDto {

@@ -1,4 +1,4 @@
-import { Repository } from "typeorm";
+import { In, Repository } from "typeorm";
 import { PrinterMaintenanceLog } from "@/entities/printer-maintenance-log.entity";
 import { TypeormService } from "@/services/typeorm/typeorm.service";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
@@ -129,6 +129,33 @@ export class PrinterMaintenanceLogService {
         completed: false,
       },
     });
+  }
+
+  async hasActiveByPrinterId(printerId: number): Promise<boolean> {
+    const count = await this.repository.count({
+      where: {
+        printerId,
+        completed: false,
+      },
+    });
+    return count > 0;
+  }
+
+  async getActivePrinterIdsSet(printerIds?: number[]): Promise<Set<number>> {
+    const where: { completed: boolean; printerId?: ReturnType<typeof In> } = { completed: false };
+    if (printerIds !== undefined) {
+      if (printerIds.length === 0) {
+        return new Set();
+      }
+      where.printerId = In(printerIds);
+    }
+
+    const logs = await this.repository.find({
+      where,
+      select: ["printerId"],
+    });
+
+    return new Set(logs.map((l) => l.printerId).filter((id): id is number => id !== null));
   }
 
   async list(filters: {
