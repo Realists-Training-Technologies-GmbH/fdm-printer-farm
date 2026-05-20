@@ -118,6 +118,14 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
         const jobState = await this.prusaLinkApi.getJobState();
         this.updateSocketState(SOCKET_STATE.authenticated);
         this.updateApiState(API_STATE.responding);
+
+        // PrusaLink's OctoPrint-compat /api/printer returns operational:false while idle
+        // on Buddy firmware — the dashboard reads that as Offline. Normalize on success.
+        const flags = printerState.state.flags;
+        if (flags && !flags.error && !flags.closedOnError) {
+          flags.operational = true;
+        }
+
         await this.emitEvent("current", {
           ...printerState,
           job: jobState.job,

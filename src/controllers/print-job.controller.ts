@@ -323,7 +323,12 @@ export class PrintJobController {
     const job = await this.printJobService.getJobByIdOrFail(jobId);
     const deleteFileParam = req.query.deleteFile === "true";
 
-    if (job.status === "PRINTING" || job.status === "PAUSED") {
+    // Only block when the printer has actually started printing. `submitToPrinter`
+    // flips status to PRINTING the moment the job is dispatched to the queue handler,
+    // but the printer itself hasn't begun until `handlePrintStarted` fires and sets
+    // `progress` to a non-null value. Allow delete in that submission window.
+    const printerHasStarted = job.progress !== null;
+    if ((job.status === "PRINTING" && printerHasStarted) || job.status === "PAUSED") {
       res.status(400).send({
         error: "Cannot delete active print job",
         status: job.status,

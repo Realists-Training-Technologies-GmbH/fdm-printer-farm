@@ -6,6 +6,7 @@ import { ROLES } from "@/constants/authorization.constants";
 import { validateMiddleware } from "@/handlers/validators";
 import { ServerReleaseService } from "@/services/core/server-release.service";
 import { ClientBundleService } from "@/services/core/client-bundle.service";
+import { BrandingService } from "@/services/core/branding.service";
 import { PrinterCache } from "@/state/printer.cache";
 import { YamlService } from "@/services/core/yaml.service";
 import { MulterService } from "@/services/core/multer.service";
@@ -28,6 +29,7 @@ export class ServerPrivateController {
     private readonly printerCache: PrinterCache,
     private readonly printerService: IPrinterService,
     private readonly clientBundleService: ClientBundleService,
+    private readonly brandingService: BrandingService,
     private readonly githubService: GithubService,
     private readonly logDumpService: LogDumpService,
     private readonly yamlService: YamlService,
@@ -82,6 +84,11 @@ export class ServerPrivateController {
 
     if (willExecute.targetVersion) {
       await this.clientBundleService.downloadClientUpdate(willExecute.targetVersion);
+      try {
+        await this.brandingService.applyToBundles();
+      } catch (e: any) {
+        this.logger.warn(`Failed to re-apply custom branding after bundle update: ${e.message}`);
+      }
     }
 
     return res.send({

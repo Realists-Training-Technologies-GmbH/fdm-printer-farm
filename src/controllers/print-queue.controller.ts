@@ -10,7 +10,11 @@ import { PrinterCache } from "@/state/printer.cache";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
 import { LoggerService } from "@/handlers/logger";
 import { ParamId } from "@/middleware/param-converter.middleware";
-import { NotFoundException } from "@/exceptions/runtime.exceptions";
+import { BadRequestException, NotFoundException } from "@/exceptions/runtime.exceptions";
+import type { FileFormatType } from "@/entities/print-job.entity";
+import { PrusaLinkType, type PrinterType } from "@/services/printer-api.interface";
+import { getIncompatibilityReason } from "@/utils/printer-compatibility.util";
+import { PrinterFirmwareCache } from "@/state/printer-firmware.cache";
 
 @route(AppConstants.apiRoute + "/print-queue")
 @before([authenticate(), authorizeRoles([ROLES.ADMIN, ROLES.OPERATOR])])
@@ -23,6 +27,7 @@ export class PrintQueueController {
     private readonly printJobService: PrintJobService,
     private readonly fileStorageService: FileStorageService,
     private readonly printerCache: PrinterCache,
+    private readonly printerFirmwareCache: PrinterFirmwareCache,
   ) {
     this.logger = loggerFactory(PrintQueueController.name);
   }
@@ -62,6 +67,105 @@ export class PrintQueueController {
     } catch (error) {
       this.logger.error(`Failed to get global queue: ${error}`);
       res.status(500).send({ error: "Failed to get global queue" });
+    }
+  }
+
+  /**
+   * Return the list of printers that can natively print the given file.
+   *
+   * Used by the UI to filter the printer picker so users only see printers
+   * compatible with the selected file's format. Declared before the
+   * `:printerId` parametric route so "compatible-printers" isn't matched as
+   * a printer id.
+   *
+   * Query params (one is required):
+   *   - fileStorageId: a file in local file storage
+   *   - jobId: an existing print job (uses its fileFormat)
+   *   - fileFormat: explicit file format ("gcode" | "bgcode" | "3mf")
+   */
+  @GET()
+  @route("/compatible-printers")
+  async getCompatiblePrinters(req: Request, res: Response) {
+    const fileStorageId = typeof req.query.fileStorageId === "string" ? req.query.fileStorageId : undefined;
+    const fileFormatQuery = typeof req.query.fileFormat === "string" ? req.query.fileFormat : undefined;
+    const jobIdQuery = typeof req.query.jobId === "string" ? req.query.jobId : undefined;
+
+    let fileFormat: FileFormatType | undefined;
+    let resolvedFileName: string | undefined;
+
+    try {
+      if (fileStorageId) {
+        const exists = await this.fileStorageService.fileExists(fileStorageId);
+        if (!exists) {
+          throw new NotFoundException("File not found in storage");
+        }
+        const metadata = await this.fileStorageService.loadMetadata(fileStorageId);
+        fileFormat = (metadata?.fileFormat as FileFormatType | undefined) ?? undefined;
+        resolvedFileName = metadata?._originalFileName ?? metadata?.fileName;
+      } else if (jobIdQuery) {
+        const jobId = Number.parseInt(jobIdQuery, 10);
+        if (Number.isNaN(jobId)) {
+          throw new BadRequestException("jobId must be a number");
+        }
+        const job = await this.printJobService.getJobByIdOrFail(jobId);
+        fileFormat = (job.fileFormat as FileFormatType | null) ?? undefined;
+        resolvedFileName = job.fileName;
+      } else if (fileFormatQuery) {
+        fileFormat = fileFormatQuery as FileFormatType;
+      } else {
+        throw new BadRequestException("One of fileStorageId, jobId, or fileFormat is required");
+      }
+
+      const allPrinters = await this.printerCache.listCachedPrinters(true);
+
+      // For .bgcode we need to dig deeper than printer type — legacy
+      // MK2.x/MK3/MK3S printers run Marlin on an 8-bit Einsy board and can't
+      // decode binary G-code even though PrusaLink fronts them. Warm the
+      // firmware cache in parallel for the PrusaLink set so this stays fast.
+      const needsModelCheck = fileFormat === "bgcode";
+      if (needsModelCheck) {
+        await Promise.all(
+          allPrinters
+            .filter((p) => p.printerType === PrusaLinkType && p.enabled)
+            .map((p) => this.printerFirmwareCache.getOrFetch(p.id).catch(() => null)),
+        );
+      }
+
+      const enriched = allPrinters.map((printer) => {
+        const typeReason = getIncompatibilityReason(printer.printerType as PrinterType, fileFormat);
+        if (typeReason) {
+          return { printer, compatible: false, reason: typeReason };
+        }
+
+        if (needsModelCheck && printer.printerType === PrusaLinkType) {
+          const info = this.printerFirmwareCache.getCachedInfoSync(printer.id);
+          if (info?.supportsBgcode === false) {
+            const modelLabel = info.model ?? "this PrusaLink model";
+            return {
+              printer,
+              compatible: false,
+              reason: `Binary G-code (.bgcode) is only supported by 32-bit Buddy boards (MK4, MK3.9, MK3.5, XL, MINI+, Core One). ${modelLabel} runs Marlin on a legacy 8-bit board and cannot decode .bgcode — upload as plain .gcode instead.`,
+            };
+          }
+        }
+
+        return { printer, compatible: true, reason: null };
+      });
+
+      res.send({
+        fileFormat: fileFormat ?? null,
+        fileName: resolvedFileName ?? null,
+        compatible: enriched.filter((p) => p.compatible).map((p) => p.printer),
+        incompatible: enriched
+          .filter((p) => !p.compatible)
+          .map((p) => ({ ...p.printer, incompatibilityReason: p.reason })),
+      });
+    } catch (error) {
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      this.logger.error(`Failed to compute compatible printers: ${error}`);
+      res.status(500).send({ error: "Failed to compute compatible printers" });
     }
   }
 
@@ -266,6 +370,38 @@ export class PrintQueueController {
       }
 
       const printer = await this.printerCache.getCachedPrinterOrThrowAsync(printerId);
+
+      // Defence in depth: even if a stale UI lets the user pick an incompatible
+      // printer, refuse server-side so we don't queue a file the printer can't
+      // ever run (e.g. .bgcode on OctoPrint, .gcode on Bambu).
+      const fileFormat = metadata.fileFormat as FileFormatType | undefined;
+      const incompatibilityReason = getIncompatibilityReason(printer.printerType as PrinterType, fileFormat);
+      if (incompatibilityReason) {
+        res.status(400).send({
+          error: "Incompatible printer for this file",
+          message: incompatibilityReason,
+          fileFormat: metadata.fileFormat ?? null,
+          printerType: printer.printerType,
+        });
+        return;
+      }
+
+      // .bgcode requires Buddy firmware on a 32-bit board. Block submission to
+      // a legacy MK2.x/MK3/MK3S even though they show up as PrusaLink-typed.
+      if (fileFormat === "bgcode" && printer.printerType === PrusaLinkType) {
+        const info = await this.printerFirmwareCache.getOrFetch(printerId);
+        if (info.supportsBgcode === false) {
+          const modelLabel = info.model ?? "this PrusaLink model";
+          res.status(400).send({
+            error: "Incompatible printer for this file",
+            message: `Binary G-code (.bgcode) cannot be printed on ${modelLabel}. Re-slice as plain .gcode or pick a Buddy-firmware printer (MK4, MK3.9, MK3.5, XL, MINI+, Core One).`,
+            fileFormat: metadata.fileFormat ?? null,
+            printerType: printer.printerType,
+            printerModel: info.model ?? null,
+          });
+          return;
+        }
+      }
 
       const job = await this.printJobService.createPendingJob(
         printerId,

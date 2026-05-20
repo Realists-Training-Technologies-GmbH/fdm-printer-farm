@@ -33,6 +33,7 @@ export const DITokens = {
   githubService: "githubService",
   octokitService: "octokitService",
   clientBundleService: "clientBundleService",
+  brandingService: "brandingService",
   logDumpService: "logDumpService",
   userTokenService: "userTokenService",
   authService: "authService",
@@ -70,6 +71,7 @@ export const DITokens = {
   printerCache: "printerCache",
   printerEventsCache: "printerEventsCache",
   printerThumbnailCache: "printerThumbnailCache",
+  printerFirmwareCache: "printerFirmwareCache",
   fileUploadTrackerCache: "fileUploadTrackerCache",
   // Tasks
   bootTask: "bootTask",

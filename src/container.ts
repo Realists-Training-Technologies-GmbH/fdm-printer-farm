@@ -27,6 +27,7 @@ import { PrinterWebsocketRestoreTask } from "./tasks/printer-websocket-restore.t
 import { ConfigService, type IConfigService } from "./services/core/config.service";
 import { SocketIoGateway } from "./state/socket-io.gateway";
 import { ClientBundleService } from "./services/core/client-bundle.service";
+import { BrandingService } from "./services/core/branding.service";
 import { FloorStore } from "./state/floor.store";
 import { YamlService } from "./services/core/yaml.service";
 import { MonsterPiService } from "./services/core/monsterpi.service";
@@ -71,6 +72,7 @@ import { PrintJobService } from "@/services/orm/print-job.service";
 import { FileAnalysisService } from "@/services/file-analysis.service";
 import { PrintJobAnalysisTask } from "@/tasks/print-job-analysis.task";
 import { PrintFileDownloaderService } from "@/services/print-file-downloader.service";
+import { PrinterFirmwareCache } from "@/state/printer-firmware.cache";
 
 export function configureContainer() {
   const container = createContainer({
@@ -136,6 +138,7 @@ export function configureContainer() {
       });
     }),
     [di.clientBundleService]: asClass(ClientBundleService),
+    [di.brandingService]: asClass(BrandingService).singleton(),
     [di.logDumpService]: asClass(LogDumpService),
     [di.httpClientFactory]: asClass(HttpClientFactory),
     [di.socketIoGateway]: asClass(SocketIoGateway).singleton(),
@@ -159,6 +162,7 @@ export function configureContainer() {
 
     [di.floorStore]: asClass(FloorStore).singleton(),
     [di.printerThumbnailCache]: asClass(PrinterThumbnailCache).singleton(),
+    [di.printerFirmwareCache]: asClass(PrinterFirmwareCache).singleton(),
     [di.fileUploadTrackerCache]: asClass(FileUploadTrackerCache).singleton(),
     [di.printerCache]: asClass(PrinterCache).singleton(),
     [di.printerEventsCache]: asClass(PrinterEventsCache).singleton(),
