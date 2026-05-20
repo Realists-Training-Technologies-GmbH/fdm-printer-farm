@@ -217,8 +217,26 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
       // for the current state (especially during ATTENTION).
       const printerMessage = status?.printer?.status_printer?.message ?? null;
 
+      // The rest of the system (PrinterControlDialog, attention helper,
+      // tile temperature overlay) expects an OctoPrint-style `temps`
+      // array. PrusaLink only sends a single-snapshot `temperature`
+      // object; mirror it into a one-element array so consumers stay
+      // adapter-agnostic.
+      const temperature = (printerState as any)?.temperature;
+      const tempsArray =
+        temperature?.tool0 || temperature?.bed
+          ? [
+              {
+                time: Math.floor(Date.now() / 1000),
+                tool0: temperature?.tool0,
+                bed: temperature?.bed,
+              },
+            ]
+          : (printerState as any)?.temps;
+
       await this.emitEvent("current", {
         ...printerState,
+        temps: tempsArray,
         job: jobState.job,
         progress: {
           printTime: jobState.progress?.printTime ?? null,
