@@ -446,11 +446,24 @@ export class PrintQueueController {
       }
 
       res.send({
-        message: "Processing next job in queue",
+        message: "Submitted next job in queue to printer",
         printerId,
-        nextJob,
+        nextJob: {
+          id: nextJob.id,
+          fileName: nextJob.fileName,
+          status: nextJob.status,
+        },
       });
     } catch (error) {
+      // BadRequest (e.g. printer offline / in maintenance) gets a 4xx so the
+      // UI can show the actual reason instead of a generic "internal error".
+      if (error instanceof BadRequestException) {
+        res.status(400).send({
+          error: "Cannot process queue",
+          message: error.message,
+        });
+        return;
+      }
       this.logger.error(`Failed to process queue for printer ${printerId}: ${error}`);
       res.status(500).send({
         error: "Failed to process queue",

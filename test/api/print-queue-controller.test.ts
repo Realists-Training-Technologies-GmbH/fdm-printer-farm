@@ -545,7 +545,11 @@ describe("PrintQueueController", () => {
   });
 
   describe("POST /print-queue/:printerId/process - Process Queue", () => {
-    it("should start next job in queue", async () => {
+    it("should refuse to process when the printer isn't connected", async () => {
+      // processQueue now actually submits the next job (it used to be a no-op
+      // event emit). With no live socket in the test harness the connectivity
+      // precheck refuses with 400 — which is what we want in production too:
+      // leave the job in the queue rather than mark it FAILED.
       const printer = await createTestPrinter(testRequest);
       const job = await printJobService.createPendingJob(printer.id, "test-process.gcode", {
         fileName: "test-process.gcode",
@@ -573,10 +577,9 @@ describe("PrintQueueController", () => {
 
       const res = await testRequest.post(`${baseRoute}/${printer.id}/process`).set("Accept", "application/json");
 
-      expect(res.status).toBe(200);
-      expect(res.body.message).toContain("Processing next job");
-      expect(res.body.printerId).toBe(printer.id);
-      expect(res.body.nextJob).toBeDefined();
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Cannot process queue");
+      expect(res.body.message).toMatch(/not ready/i);
     });
 
     it("should return message when queue is empty", async () => {

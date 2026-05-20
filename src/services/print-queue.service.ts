@@ -249,14 +249,22 @@ export class PrintQueueService implements IPrintQueueService {
       return null;
     }
 
+    // Refuse to submit when the printer isn't actually reachable — the
+    // submission would fail mid-upload and flip the job to FAILED, forcing the
+    // user to requeue. Better to leave the job in queue and surface the reason.
+    const connectivity = this.isPrinterConnected(printerId);
+    if (!connectivity.connected) {
+      throw new BadRequestException(
+        `Cannot process queue: printer ${printerId} is not ready. ${connectivity.reason ?? ""}`.trim(),
+      );
+    }
+
     this.logger.log(`Processing queue: next job is ${nextJob.id} (${nextJob.fileName})`);
 
-    this.eventEmitter2.emit("printQueue.processNext", {
-      printerId,
-      jobId: nextJob.id,
-      fileName: nextJob.fileName,
-      fileStorageId: nextJob.fileStorageId,
-    });
+    // Actually push the file to the printer and start it. Previous behaviour
+    // only fired an event with no listener, so "Process next" was a silent
+    // no-op for the user.
+    await this.submitToPrinter(printerId, nextJob.id);
 
     return nextJob;
   }
