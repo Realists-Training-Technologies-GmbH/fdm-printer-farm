@@ -386,18 +386,59 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async pausePrint(): Promise<void> {
-    const jobId = await this.requireCurrentJobId("pause");
-    await this.client.put<void>(`/api/v1/job/${jobId}/pause`);
+    await this.runJobControl("pause", (jobId) => this.client.put<void>(`/api/v1/job/${jobId}/pause`));
   }
 
   async resumePrint(): Promise<void> {
-    const jobId = await this.requireCurrentJobId("resume");
-    await this.client.put<void>(`/api/v1/job/${jobId}/resume`);
+    await this.runJobControl("resume", (jobId) => this.client.put<void>(`/api/v1/job/${jobId}/resume`));
   }
 
   async cancelPrint(): Promise<void> {
-    const jobId = await this.requireCurrentJobId("cancel");
-    await this.client.delete<void>(`/api/v1/job/${jobId}`);
+    await this.runJobControl("cancel", (jobId) => this.client.delete<void>(`/api/v1/job/${jobId}`));
+  }
+
+  /**
+   * Run a job-control action with a fallback path for printers in ATTENTION /
+   * mid-error states. Buddy firmware sometimes drops `status.job.id` from
+   * `/api/v1/status` while waiting on the user (filament runout, calibration,
+   * etc.), which would make the v1 endpoint un-callable. We retry the legacy
+   * OctoPrint-compatible `POST /api/job` body — it doesn't need a job id and
+   * is the one PrusaLink-Web itself uses for the "Stop" button.
+   */
+  private async runJobControl(
+    action: "pause" | "resume" | "cancel",
+    callV1: (jobId: number) => Promise<unknown>,
+  ): Promise<void> {
+    const jobId = await this.getCurrentJobId();
+    if (jobId) {
+      try {
+        await callV1(jobId);
+        return;
+      } catch (err) {
+        const status = (err as AxiosError)?.response?.status;
+        // Only fall back when the v1 endpoint actually rejected this specific
+        // command — network errors and 401s should still surface.
+        if (status !== 404 && status !== 409 && status !== 405) throw err;
+        this.logger.warn(`PrusaLink v1 ${action} returned ${status}; trying OctoPrint-compat fallback`, this.logMeta());
+      }
+    }
+
+    const legacyCommand = action === "cancel" ? "cancel" : action;
+    try {
+      await this.client.post<void>("/api/job", { command: legacyCommand });
+    } catch (err) {
+      throw new ExternalServiceError(
+        {
+          error:
+            action === "cancel"
+              ? "Could not cancel the print. The printer may be in ATTENTION — resolve it from the front panel, then try again."
+              : `Could not ${action} the print. The printer didn't accept the command — try again or use the front panel.`,
+          statusCode: (err as AxiosError)?.response?.status ?? 409,
+          success: false,
+        },
+        "Prusa-Link",
+      );
+    }
   }
 
   quickStop(): Promise<void> {
@@ -734,22 +775,6 @@ export class PrusaLinkApi implements IPrinterApi {
   private async getCurrentJobId() {
     const status = await this.getStatus();
     return status.job?.id;
-  }
-
-  private async requireCurrentJobId(action: string): Promise<number> {
-    const jobId = await this.getCurrentJobId();
-    if (!jobId) {
-      this.logger.warn(`Cannot ${action} print: no active job on this printer`, this.logMeta());
-      throw new ExternalServiceError(
-        {
-          error: `Cannot ${action} print: no active job on this printer.`,
-          statusCode: 409,
-          success: false,
-        },
-        "Prusa-Link",
-      );
-    }
-    return jobId;
   }
 
   /**

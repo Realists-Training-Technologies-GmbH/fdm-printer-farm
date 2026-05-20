@@ -153,8 +153,16 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
       this.consecutiveAuthFailures = 0;
 
       const linkState = printerState.state?.flags?.link_state;
+      const attentionMessage = status?.printer?.status_printer?.message;
       if (linkState && linkState !== "PRINTING") {
-        printerState.state.text = linkState;
+        // When the printer is in ATTENTION, surface the firmware's reason
+        // ("Filament runout", "Heating error", etc.) instead of the bare
+        // state label so the dashboard tells the user what to fix.
+        if (linkState.toUpperCase() === "ATTENTION" && attentionMessage) {
+          printerState.state.text = `ATTENTION: ${attentionMessage}`;
+        } else {
+          printerState.state.text = linkState;
+        }
       }
 
       // Map PrusaLink's link_state to the boolean flag set the dashboard reads.
@@ -164,7 +172,12 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
       if (flags) {
         const ls = (linkState ?? "").toUpperCase();
         flags.operational = ls !== "ERROR";
-        flags.printing = ls === "PRINTING";
+        // ATTENTION still has a job loaded and "running" from the firmware's
+        // perspective — keep `printing: true` so the dashboard shows the
+        // pause/cancel controls instead of hiding them as if no job was
+        // active. The `error: true` flag below tells the UI to still surface
+        // the attention banner.
+        flags.printing = ls === "PRINTING" || ls === "ATTENTION";
         flags.paused = ls === "PAUSED";
         flags.pausing = ls === "PAUSING";
         flags.cancelling = ls === "STOPPED" || ls === "CANCELLING";
@@ -199,6 +212,10 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
           }
         : null;
       const freeSpace = status?.storage?.free_space ?? null;
+      // Carry the firmware's own status text alongside the link_state mapping
+      // so the frontend can show a tooltip with the printer's exact reason
+      // for the current state (especially during ATTENTION).
+      const printerMessage = status?.printer?.status_printer?.message ?? null;
 
       await this.emitEvent("current", {
         ...printerState,
@@ -211,6 +228,7 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
         telemetry: richTelemetry ?? (printerState as any).telemetry ?? null,
         transfer,
         freeSpace,
+        printerMessage,
       });
     } catch (error) {
       this.updateSocketState(SOCKET_STATE.error);
