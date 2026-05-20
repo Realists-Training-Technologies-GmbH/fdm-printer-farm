@@ -234,10 +234,17 @@ export class PrinterEventsCache extends KeyDiffCache<PrinterEventsCacheDto> {
     if (e.event === messages.current) {
       await this.setEvent(printerId, messages.current, e.payload);
       const payload = e.payload as any;
-      const state = payload?.state;
+      // `state` is an object ({ text, flags, error }) — the adapter writes
+      // the raw PrusaLink link_state ("PRINTING", "FINISHED", "STOPPED",
+      // "ERROR", "READY"…) into `state.text` and mirrors it into flags.
+      // We used to compare the whole object to a string, so every
+      // completion/failure transition was silently missed.
+      const stateText: string | undefined = payload?.state?.text;
+      const stateUpper = stateText?.toUpperCase() ?? "";
+      const flags = payload?.state?.flags;
       const filename = payload?.job?.file?.path ?? payload?.job?.file?.display;
       const completion = payload?.progress?.completion;
-      if (state === "Printing" && filename) {
+      if (stateUpper === "PRINTING" && filename) {
         const printerName = await this.getPrinterName(printerId);
         const job = await this.printJobService.markStarted(printerId, filename, printerName);
 
@@ -254,15 +261,30 @@ export class PrinterEventsCache extends KeyDiffCache<PrinterEventsCacheDto> {
       if (typeof completion === "number" && filename) {
         await this.printJobService.markProgress(printerId, filename, completion);
       }
-      // PrusaLink states: "Printing", "Finished", "Stopped", "Error", "Operational", "Ready"
-      if (state === "Finished" && filename) {
+      // PrusaLink terminal states. ATTENTION is purposefully excluded —
+      // it's a transient hold, not a job ending. ERROR and STOPPED end
+      // the job as failed; FINISHED ends it as completed.
+      if (stateUpper === "FINISHED" && filename) {
         const job = await this.printJobService.markFinished(printerId, filename);
-        // Update printer thumbnail from completed job
         if (job) {
           await this.printerThumbnailCache.handleJobCompleted(printerId, job.id);
         }
-      } else if (["Stopped", "Error"].includes(state) && filename) {
-        await this.printJobService.markFailed(printerId, filename, state);
+      } else if (
+        (stateUpper === "STOPPED" ||
+          stateUpper === "CANCELLING" ||
+          flags?.cancelling) &&
+        filename
+      ) {
+        // STOPPED is PrusaLink's "user cancelled" terminal state. Match
+        // the controller's cancel path so the job ends up as CANCELLED
+        // instead of FAILED.
+        await this.printJobService.handlePrintCancelled(printerId, stateText ?? "Cancelled");
+      } else if (
+        (stateUpper === "ERROR" || flags?.error) &&
+        !stateUpper.startsWith("ATTENTION") &&
+        filename
+      ) {
+        await this.printJobService.markFailed(printerId, filename, stateText ?? "Error");
       }
     }
   }
