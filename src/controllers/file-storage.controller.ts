@@ -1,9 +1,10 @@
-import { before, DELETE, GET, POST, route } from "awilix-express";
+import { before, DELETE, GET, PATCH, POST, route } from "awilix-express";
 import { AppConstants } from "@/server.constants";
 import type { Request, Response } from "express";
 import { authorizeRoles, authenticate } from "@/middleware/authenticate";
 import { ROLES } from "@/constants/authorization.constants";
 import { FileStorageService } from "@/services/file-storage.service";
+import { FileStorageFolderService } from "@/services/file-storage-folder.service";
 import { MulterService } from "@/services/core/multer.service";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
 import { LoggerService } from "@/handlers/logger";
@@ -20,6 +21,7 @@ export class FileStorageController {
   constructor(
     loggerFactory: ILoggerFactory,
     private readonly fileStorageService: FileStorageService,
+    private readonly fileStorageFolderService: FileStorageFolderService,
     private readonly multerService: MulterService,
     private readonly fileAnalysisService: FileAnalysisService,
   ) {
@@ -29,10 +31,33 @@ export class FileStorageController {
   @GET()
   async listFiles(req: Request, res: Response) {
     try {
-      const files = await this.fileStorageService.listAllFiles();
+      // `folderPath` is the absolute slash-path the client is browsing.
+      // Omitted / `/` = root. `recursive=true` returns the full subtree, useful
+      // for search UIs.
+      const requestedFolder = FileStorageFolderService.normalisePath((req.query.folderPath as string) ?? null);
+      const recursive = (req.query.recursive as string) === "true";
+
+      const all = await this.fileStorageService.listAllFiles();
+      const filtered = all.filter((file) => {
+        const fp: string | null = file.metadata?._folderPath ?? null;
+        if (recursive) {
+          if (requestedFolder === null) return true;
+          return fp === requestedFolder || (fp ?? "").startsWith(requestedFolder + "/");
+        }
+        // Non-recursive: only direct children of `requestedFolder`.
+        return (fp ?? null) === requestedFolder;
+      });
+
+      const folders = await this.fileStorageFolderService.listChildren(requestedFolder);
 
       res.send({
-        files: files.map((file) => {
+        folderPath: requestedFolder ?? "/",
+        folders: folders.map((f) => ({
+          path: f.path,
+          name: f.name,
+          createdAt: f.createdAt,
+        })),
+        files: filtered.map((file) => {
           const thumbnails = (file.metadata?._thumbnails || []).map((thumb: any) => ({
             index: thumb.index,
             width: thumb.width,
@@ -47,16 +72,124 @@ export class FileStorageController {
             fileSize: file.fileSize,
             fileHash: file.fileHash,
             createdAt: file.createdAt,
+            folderPath: file.metadata?._folderPath ?? null,
             thumbnails,
             metadata: file.metadata,
           };
         }),
-        totalCount: files.length,
+        totalCount: filtered.length,
       });
     } catch (error) {
       this.logger.error(`Failed to list files: ${error}`);
       res.status(500).send({ error: "Failed to list files" });
     }
+  }
+
+  /**
+   * Whole folder tree at once — handy for sidebar/tree views that need to
+   * render every node without paginating through `?folderPath`.
+   */
+  @GET()
+  @route("/folders/tree")
+  async getFolderTree(_req: Request, res: Response) {
+    const folders = await this.fileStorageFolderService.listAll();
+    res.send({ folders });
+  }
+
+  @POST()
+  @route("/folders")
+  async createFolder(req: Request, res: Response) {
+    const body = req.body as { path?: unknown };
+    if (typeof body?.path !== "string" || body.path.trim() === "") {
+      throw new BadRequestException("`path` is required (absolute, e.g. /clientes/empresa-x)");
+    }
+    const created = await this.fileStorageFolderService.createFolder(body.path);
+    res.status(201).send(created);
+  }
+
+  @PATCH()
+  @route("/folders")
+  async renameFolder(req: Request, res: Response) {
+    const body = req.body as { from?: unknown; to?: unknown };
+    if (typeof body?.from !== "string" || typeof body?.to !== "string") {
+      throw new BadRequestException("`from` and `to` are required");
+    }
+    const oldPath = FileStorageFolderService.normalisePath(body.from);
+    if (!oldPath) {
+      throw new BadRequestException("Cannot rename the root folder");
+    }
+
+    const updated = await this.fileStorageFolderService.renameFolder(body.from, body.to);
+    // Re-parent files that lived under the old path onto the new one so the
+    // folder rename is reflected in the file metadata too.
+    const moved = await this.fileStorageService.moveFilesToFolder(oldPath, updated.path);
+    res.send({ folder: updated, filesUpdated: moved });
+  }
+
+  @DELETE()
+  @route("/folders")
+  async deleteFolder(req: Request, res: Response) {
+    const rawPath = (req.query.path as string) ?? "";
+    const force = (req.query.force as string) === "true";
+    const cascade = (req.query.cascade as string) === "true";
+
+    const normalised = FileStorageFolderService.normalisePath(rawPath);
+    if (!normalised) {
+      throw new BadRequestException("`path` query param is required and cannot be root");
+    }
+
+    // Refuse the delete if files still live inside the subtree, unless the
+    // caller opted into cascading: in that case we move files back to root
+    // before removing the folder rows (the file binaries are never lost).
+    const all = await this.fileStorageService.listAllFiles();
+    const filesInside = all.filter((f) => {
+      const fp: string | null = f.metadata?._folderPath ?? null;
+      if (!fp) return false;
+      return fp === normalised || fp.startsWith(normalised + "/");
+    });
+
+    if (filesInside.length > 0) {
+      if (!cascade) {
+        res.status(409).send({
+          error: `Folder ${normalised} still contains ${filesInside.length} file(s). Pass cascade=true to move them back to root, or move/delete them first.`,
+          filesInside: filesInside.length,
+        });
+        return;
+      }
+      for (const f of filesInside) {
+        await this.fileStorageService.setFolderPath(f.fileStorageId, null);
+      }
+    }
+
+    const result = await this.fileStorageFolderService.deleteFolder(rawPath, { force });
+    res.send({ deletedPaths: result.deletedPaths, filesMovedToRoot: filesInside.length });
+  }
+
+  @PATCH()
+  @route("/:fileStorageId/folder")
+  async moveFile(req: Request, res: Response) {
+    const { fileStorageId } = req.params as { fileStorageId: string };
+    const body = req.body as { folderPath?: unknown };
+
+    const exists = await this.fileStorageService.fileExists(fileStorageId);
+    if (!exists) {
+      res.status(404).send({ error: "File not found" });
+      return;
+    }
+
+    // `null` / empty / "/" means move back to root. Any other value must
+    // refer to an existing folder.
+    const raw = typeof body?.folderPath === "string" ? body.folderPath : null;
+    const normalised = FileStorageFolderService.normalisePath(raw);
+    if (normalised !== null) {
+      const folder = await this.fileStorageFolderService.findByPath(normalised);
+      if (!folder) {
+        throw new BadRequestException(`Folder ${normalised} doesn't exist — create it first`);
+      }
+    }
+
+    await this.fileStorageService.setFolderPath(fileStorageId, normalised);
+    res.send({ fileStorageId, folderPath: normalised });
   }
 
   /**
@@ -237,6 +370,13 @@ export class FileStorageController {
     const file = files[0];
     await this.fileStorageService.validateUniqueFilename(file.originalname);
 
+    // Optional folder destination — accepted as form field alongside the file.
+    const rawFolderPath = typeof req.body?.folderPath === "string" ? req.body.folderPath : null;
+    const folderPath = FileStorageFolderService.normalisePath(rawFolderPath);
+    if (folderPath && !(await this.fileStorageFolderService.findByPath(folderPath))) {
+      throw new BadRequestException(`Folder ${folderPath} doesn't exist — create it before uploading into it`);
+    }
+
     const ext = extname(file.originalname);
     const tempPathWithExt = file.path + ext;
 
@@ -260,6 +400,7 @@ export class FileStorageController {
         fileHash,
         file.originalname,
         thumbnailMetadata,
+        folderPath,
       );
 
       res.send({
@@ -268,6 +409,7 @@ export class FileStorageController {
         fileName: file.originalname,
         fileSize: file.size,
         fileHash,
+        folderPath,
         metadata,
         thumbnailCount: thumbnails.length,
       });

@@ -25,7 +25,10 @@ export interface IFileStorageService {
     fileHash?: string,
     originalFileName?: string,
     thumbnailMetadata?: any[],
+    folderPath?: string | null,
   ): Promise<void>;
+  setFolderPath(fileStorageId: string, folderPath: string | null): Promise<void>;
+  moveFilesToFolder(sourceFolderPath: string, destinationFolderPath: string | null): Promise<number>;
   loadMetadata(fileStorageId: string): Promise<any | null>;
   hasMetadata(fileStorageId: string): Promise<boolean>;
   getDeterministicId(fileHash: string, fileName: string): string;
@@ -259,6 +262,7 @@ export class FileStorageService implements IFileStorageService {
     fileHash?: string,
     originalFileName?: string,
     thumbnailMetadata?: any[],
+    folderPath?: string | null,
   ): Promise<void> {
     const filePath = await this.findFilePath(fileStorageId);
     if (!filePath) {
@@ -270,6 +274,10 @@ export class FileStorageService implements IFileStorageService {
 
     let existingOriginalFileName = originalFileName;
     let existingThumbnails = thumbnailMetadata;
+    // `undefined` from the caller means "leave it alone", `null` means "move
+    // back to root". Track the existing folderPath so we keep it when no
+    // explicit choice was passed.
+    let resolvedFolderPath: string | null | undefined = folderPath;
     try {
       const existingContent = await readFile(metadataPath, "utf8");
       const existing = JSON.parse(existingContent);
@@ -278,6 +286,9 @@ export class FileStorageService implements IFileStorageService {
       }
       if (existing._thumbnails && !thumbnailMetadata) {
         existingThumbnails = existing._thumbnails;
+      }
+      if (folderPath === undefined && "_folderPath" in existing) {
+        resolvedFolderPath = existing._folderPath ?? null;
       }
     } catch {}
 
@@ -288,11 +299,62 @@ export class FileStorageService implements IFileStorageService {
       _fileStorageId: fileStorageId,
       _originalFileName: existingOriginalFileName || metadata.fileName || null,
       _thumbnails: existingThumbnails || [],
+      _folderPath: resolvedFolderPath ?? null,
     };
 
     await writeFile(metadataPath, JSON.stringify(metadataWithMeta, null, 2), "utf8");
     const thumbnailMeta = thumbnailMetadata ? ` with ${thumbnailMetadata.length} thumbnail(s)` : "";
     this.logger.debug(`Saved metadata for ${fileStorageId}${thumbnailMeta}`);
+  }
+
+  /**
+   * Update only the folder assignment for a file, preserving everything else
+   * in the metadata JSON. Pass `null` to move the file back to the root.
+   */
+  async setFolderPath(fileStorageId: string, folderPath: string | null): Promise<void> {
+    const existing = (await this.loadMetadata(fileStorageId)) ?? {};
+    const cleaned = { ...existing };
+    // saveMetadata re-injects the underscored fields so strip them here to
+    // avoid duplication after the spread.
+    delete cleaned._fileHash;
+    delete cleaned._analyzedAt;
+    delete cleaned._fileStorageId;
+    delete cleaned._originalFileName;
+    delete cleaned._thumbnails;
+    delete cleaned._folderPath;
+
+    await this.saveMetadata(
+      fileStorageId,
+      cleaned,
+      existing?._fileHash ?? undefined,
+      existing?._originalFileName ?? undefined,
+      existing?._thumbnails ?? undefined,
+      folderPath,
+    );
+  }
+
+  /**
+   * Re-parent every file currently filed under `sourceFolderPath` (or any of
+   * its subpaths) onto `destinationFolderPath`. Used by folder rename / move.
+   * Returns the number of files updated.
+   */
+  async moveFilesToFolder(sourceFolderPath: string, destinationFolderPath: string | null): Promise<number> {
+    const all = await this.listAllFiles();
+    let moved = 0;
+    for (const file of all) {
+      const fp: string | null = file.metadata?._folderPath ?? null;
+      if (!fp) continue;
+      if (fp === sourceFolderPath || fp.startsWith(sourceFolderPath + "/")) {
+        const suffix = fp.substring(sourceFolderPath.length);
+        const newPath = destinationFolderPath ? `${destinationFolderPath}${suffix}` : suffix ? suffix : null;
+        await this.setFolderPath(file.fileStorageId, newPath);
+        moved += 1;
+      }
+    }
+    if (moved > 0) {
+      this.logger.log(`Moved ${moved} file(s) from ${sourceFolderPath} to ${destinationFolderPath ?? "root"}`);
+    }
+    return moved;
   }
 
   async loadMetadata(fileStorageId: string): Promise<any | null> {
