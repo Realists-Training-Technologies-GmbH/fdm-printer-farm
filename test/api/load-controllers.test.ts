@@ -5,6 +5,7 @@ describe("load-controllers test", () => {
     expect(Object.keys(result), "API Controllers loaded should match").toMatchObject([
       "/src/controllers/auth.controller.ts",
       "/src/controllers/batch-call.controller.ts",
+      "/src/controllers/branding.controller.ts",
       "/src/controllers/camera-stream.controller.ts",
       "/src/controllers/file-storage.controller.ts",
       "/src/controllers/first-time-setup.controller.ts",
