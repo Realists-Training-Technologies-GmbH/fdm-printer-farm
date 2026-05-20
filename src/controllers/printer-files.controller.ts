@@ -17,11 +17,14 @@ import { MulterService } from "@/services/core/multer.service";
 import { LoggerService } from "@/handlers/logger";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
 import type { Request, Response } from "express";
-import { BambuType, type IPrinterApi, PrusaLinkType } from "@/services/printer-api.interface";
+import { BambuType, type IPrinterApi, type PrinterType, PrusaLinkType } from "@/services/printer-api.interface";
 import { PrinterThumbnailCache } from "@/state/printer-thumbnail.cache";
+import { PrinterFirmwareCache } from "@/state/printer-firmware.cache";
 import { captureException } from "@sentry/node";
 import { errorSummary } from "@/utils/error.utils";
 import { getScopedPrinter } from "@/middleware/printer-resolver";
+import { getIncompatibilityReason } from "@/utils/printer-compatibility.util";
+import type { FileFormatType } from "@/entities/print-job.entity";
 import { FileAnalysisService } from "@/services/file-analysis.service";
 import { FileStorageService } from "@/services/file-storage.service";
 import { copyFileSync, createReadStream, existsSync, unlinkSync } from "node:fs";
@@ -41,6 +44,7 @@ export class PrinterFilesController {
     private readonly fileStorageService: FileStorageService,
     private readonly multerService: MulterService,
     private readonly printerThumbnailCache: PrinterThumbnailCache,
+    private readonly printerFirmwareCache: PrinterFirmwareCache,
   ) {
     this.logger = loggerFactory(PrinterFilesController.name);
   }
@@ -57,12 +61,63 @@ export class PrinterFilesController {
   @route("/:id")
   @before(permission(PERMS.PrinterFiles.Get))
   async getFiles(req: Request, res: Response) {
-    const { printerApi } = getScopedPrinter(req);
-    const { recursive: recursiveStr, startDir } = await validateInput(req.query, getFilesSchema);
+    const { printerApi, currentPrinter, currentPrinterId } = getScopedPrinter(req);
+    const {
+      recursive: recursiveStr,
+      startDir,
+      filterCompatible: filterCompatibleStr,
+    } = await validateInput(req.query, getFilesSchema);
     const recursive = recursiveStr === "true";
+    const filterCompatible = filterCompatibleStr === "true";
 
     const files = await printerApi.getFiles(recursive, startDir);
-    res.send(files);
+
+    // No filter requested → return the raw listing the printer reported, same
+    // shape as before so existing UIs don't break.
+    if (!filterCompatible || !currentPrinter) {
+      res.send(files);
+      return;
+    }
+
+    // Warm the firmware cache once so the per-file check is sync.
+    if (currentPrinter.printerType === PrusaLinkType) {
+      await this.printerFirmwareCache.getOrFetch(currentPrinterId).catch(() => null);
+    }
+    const firmwareInfo =
+      currentPrinter.printerType === PrusaLinkType
+        ? this.printerFirmwareCache.getCachedInfoSync(currentPrinterId)
+        : null;
+
+    const isCompatible = (filename: string): boolean => {
+      const ext = (filename.split(".").pop() ?? "").toLowerCase();
+      const fileFormat = (
+        ext === "gcode" ? "gcode" : ext === "bgcode" ? "bgcode" : ext === "3mf" ? "3mf" : null
+      ) as FileFormatType | null;
+      if (!fileFormat) return false;
+      if (getIncompatibilityReason(currentPrinter.printerType as PrinterType, fileFormat)) return false;
+      if (
+        fileFormat === "bgcode" &&
+        currentPrinter.printerType === PrusaLinkType &&
+        firmwareInfo?.supportsBgcode === false
+      ) {
+        return false;
+      }
+      return true;
+    };
+
+    let incompatibleCount = 0;
+    const compatibleFiles = files.files.filter((f) => {
+      const ok = isCompatible(f.path);
+      if (!ok) incompatibleCount += 1;
+      return ok;
+    });
+
+    res.send({
+      ...files,
+      files: compatibleFiles,
+      incompatibleCount,
+      printerModel: firmwareInfo?.model ?? null,
+    });
   }
 
   @POST()

@@ -26,4 +26,8 @@ export const createFolderSchema = z.object({
 export const getFilesSchema = z.object({
   recursive: z.string().optional(),
   startDir: z.string().optional(),
+  // When "true", hide files the printer can't print (mostly .bgcode on legacy
+  // 8-bit PrusaLink boards). Default is "false" — clients that pre-filter
+  // server-side opt in via this flag.
+  filterCompatible: z.string().optional(),
 });

@@ -6,6 +6,7 @@ import { ROLES } from "@/constants/authorization.constants";
 import { PrintQueueService } from "@/services/print-queue.service";
 import { PrintJobService } from "@/services/orm/print-job.service";
 import { FileStorageService } from "@/services/file-storage.service";
+import { FileStorageFolderService } from "@/services/file-storage-folder.service";
 import { PrinterCache } from "@/state/printer.cache";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
 import { LoggerService } from "@/handlers/logger";
@@ -27,6 +28,7 @@ export class PrintQueueController {
     private readonly printQueueService: PrintQueueService,
     private readonly printJobService: PrintJobService,
     private readonly fileStorageService: FileStorageService,
+    private readonly fileStorageFolderService: FileStorageFolderService,
     private readonly printerCache: PrinterCache,
     private readonly printerFirmwareCache: PrinterFirmwareCache,
     private readonly printerMaintenanceLogService: PrinterMaintenanceLogService,
@@ -181,6 +183,104 @@ export class PrintQueueController {
       this.logger.error(`Failed to compute compatible printers: ${error}`);
       res.status(500).send({ error: "Failed to compute compatible printers" });
     }
+  }
+
+  /**
+   * Files available to enqueue on a specific printer, sourced from File
+   * Storage. Filters by printer compatibility so the picker only shows
+   * actually-printable files. Honors the same folder-navigation contract as
+   * GET /file-storage (`folderPath`, `recursive`).
+   *
+   * This endpoint is the "primary" source the printer view should hit before
+   * falling back to the printer's USB stick. The USB endpoint
+   * (GET /printer-files/:id) is the secondary source for files that haven't
+   * been uploaded to File Storage yet.
+   */
+  @GET()
+  @route("/:printerId/available-files")
+  @before([ParamId("printerId")])
+  async getAvailableFilesForPrinter(req: Request, res: Response) {
+    const printerId = req.local.printerId;
+    const requestedFolder = FileStorageFolderService.normalisePath((req.query.folderPath as string) ?? null);
+    const recursive = (req.query.recursive as string) === "true";
+
+    const printer = await this.printerCache.getCachedPrinterOrThrowAsync(printerId);
+
+    // PrusaLink + .bgcode requires the firmware cache so we can tell MK4 from
+    // MK3S. Warm it once up-front so we don't fetch per file.
+    if (printer.printerType === PrusaLinkType) {
+      await this.printerFirmwareCache.getOrFetch(printerId).catch(() => null);
+    }
+    const firmwareInfo =
+      printer.printerType === PrusaLinkType ? this.printerFirmwareCache.getCachedInfoSync(printerId) : null;
+
+    const allFiles = await this.fileStorageService.listAllFiles();
+    const folders = await this.fileStorageFolderService.listChildren(requestedFolder);
+
+    // Scope to the folder the user is browsing.
+    const inFolder = allFiles.filter((file) => {
+      const fp: string | null = file.metadata?._folderPath ?? null;
+      if (recursive) {
+        if (requestedFolder === null) return true;
+        return fp === requestedFolder || (fp ?? "").startsWith(requestedFolder + "/");
+      }
+      return (fp ?? null) === requestedFolder;
+    });
+
+    let incompatibleCount = 0;
+    const compatibleFiles = inFolder.filter((file) => {
+      const fileFormat = file.metadata?.fileFormat as FileFormatType | undefined;
+      const typeReason = getIncompatibilityReason(printer.printerType as PrinterType, fileFormat);
+      if (typeReason) {
+        incompatibleCount += 1;
+        return false;
+      }
+      // .bgcode on a legacy MK3S over the PrusaLink shim — same gate as the
+      // queue submission path.
+      if (fileFormat === "bgcode" && printer.printerType === PrusaLinkType && firmwareInfo?.supportsBgcode === false) {
+        incompatibleCount += 1;
+        return false;
+      }
+      return true;
+    });
+
+    res.send({
+      printerId,
+      printerName: printer.name,
+      printerType: printer.printerType,
+      printerModel: firmwareInfo?.model ?? null,
+      folderPath: requestedFolder ?? "/",
+      folders: folders.map((f) => ({ path: f.path, name: f.name, createdAt: f.createdAt })),
+      files: compatibleFiles.map((file) => {
+        const thumbnails = (file.metadata?._thumbnails || []).map((thumb: any) => ({
+          index: thumb.index,
+          width: thumb.width,
+          height: thumb.height,
+          format: thumb.format,
+          size: thumb.size,
+        }));
+        return {
+          fileStorageId: file.fileStorageId,
+          fileName: file.fileName,
+          fileFormat: file.fileFormat,
+          fileSize: file.fileSize,
+          fileHash: file.fileHash,
+          createdAt: file.createdAt,
+          folderPath: file.metadata?._folderPath ?? null,
+          // Surface the analysed metadata so the picker can show print time /
+          // filament without an extra round-trip.
+          estimatedTimeSeconds: file.metadata?.gcodePrintTimeSeconds ?? null,
+          filamentGrams: file.metadata?.filamentUsedGrams ?? null,
+          totalLayers: file.metadata?.totalLayers ?? null,
+          thumbnails,
+        };
+      }),
+      totalCount: compatibleFiles.length,
+      incompatibleCount,
+      // Hint for the frontend: File Storage is the preferred picker source.
+      primarySource: "storage",
+      secondarySource: "usb",
+    });
   }
 
   @GET()
