@@ -21,6 +21,7 @@ import { FloorStore } from "@/state/floor.store";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
 import type { Request, Response } from "express";
 import type { IPrinterService } from "@/services/interfaces/printer.service.interface";
+import type { IPrintJobService } from "@/services/orm/print-job.service";
 import type { LoginDto } from "@/services/interfaces/login.dto";
 import { AxiosError } from "axios";
 import { FailedDependencyException } from "@/exceptions/failed-dependency.exception";
@@ -46,6 +47,7 @@ export class PrinterController {
     private readonly printerEventsCache: PrinterEventsCache,
     private readonly printerApi: IPrinterApi,
     private readonly floorStore: FloorStore,
+    private readonly printJobService: IPrintJobService,
   ) {
     this.logger = loggerFactory(PrinterController.name);
   }
@@ -252,6 +254,10 @@ export class PrinterController {
   @route("/:id/job/pause")
   async pausePrint(req: Request, res: Response) {
     await this.printerApi.pausePrint();
+    // Write the user-initiated transition straight to the DB so the
+    // jobs list reflects the action instantly instead of waiting for
+    // the next status poll to detect the firmware change.
+    await this.syncJobStatusAfterAction(req, "pause");
     res.send({});
   }
 
@@ -259,6 +265,7 @@ export class PrinterController {
   @route("/:id/job/resume")
   async resumePrint(req: Request, res: Response) {
     await this.printerApi.resumePrint();
+    await this.syncJobStatusAfterAction(req, "resume");
     res.send({});
   }
 
@@ -267,7 +274,37 @@ export class PrinterController {
   @route("/:id/job/cancel")
   async cancelPrint(req: Request, res: Response) {
     await this.printerApi.cancelPrint();
+    await this.syncJobStatusAfterAction(req, "cancel");
     res.send({});
+  }
+
+  /**
+   * Mirror a printer-side action into the PrintJob row immediately so
+   * the dashboard / jobs list don't have to wait for the next polling
+   * cycle to reflect the user's click. Errors here are non-fatal — the
+   * printer command already succeeded, and the polling loop will
+   * reconcile on its own if the immediate write fails.
+   */
+  private async syncJobStatusAfterAction(
+    req: Request,
+    action: "pause" | "resume" | "cancel",
+  ): Promise<void> {
+    try {
+      const { currentPrinterId } = getScopedPrinter(req);
+      if (action === "pause") {
+        await this.printJobService.handlePrintPaused(currentPrinterId);
+      } else if (action === "resume") {
+        await this.printJobService.handlePrintResumed(currentPrinterId);
+      } else if (action === "cancel") {
+        await this.printJobService.handlePrintCancelled(currentPrinterId, "Cancelled by user");
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Could not eagerly sync PrintJob row after ${action}; the polling loop will catch up. ${
+          (err as Error)?.message ?? err
+        }`,
+      );
+    }
   }
 
   @POST()
