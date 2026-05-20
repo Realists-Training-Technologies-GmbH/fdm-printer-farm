@@ -3,6 +3,7 @@ import { authenticate, authorizeRoles, permission } from "@/middleware/authentic
 import { validateInput } from "@/handlers/validators";
 import { AppConstants } from "@/server.constants";
 import {
+  createFolderSchema,
   downloadFileSchema,
   getFileSchema,
   getFilesSchema,
@@ -111,6 +112,22 @@ export class PrinterFilesController {
     res.send(result);
   }
 
+  @POST()
+  @route("/:id/folders")
+  @before(permission(PERMS.PrinterFiles.Upload))
+  async createFolder(req: Request, res: Response) {
+    const { path } = await validateInput(req.body, createFolderSchema);
+
+    if (typeof this.printerApi.createFolder !== "function") {
+      throw new ValidationException({
+        error: "Creating folders isn't supported on this printer type.",
+      });
+    }
+
+    await this.printerApi.createFolder(path);
+    res.send();
+  }
+
   @GET()
   @route("/:id/thumbnail")
   @before(permission(PERMS.PrinterFiles.Get))
@@ -130,7 +147,7 @@ export class PrinterFilesController {
     const files = await this.multerService.multerLoadFileAsync(req, res, acceptedExtensions, true);
 
     // FormData has key-values with type string only
-    const { startPrint: startPrintString } = await validateInput(req.body, uploadFileSchema);
+    const { startPrint: startPrintString, targetPath } = await validateInput(req.body, uploadFileSchema);
     const startPrint = startPrintString === "true";
 
     if (!files?.length) {
@@ -156,6 +173,7 @@ export class PrinterFilesController {
         contentLength: uploadedFile.size,
         startPrint,
         uploadToken: token,
+        targetPath,
       })
       .catch((e) => {
         try {

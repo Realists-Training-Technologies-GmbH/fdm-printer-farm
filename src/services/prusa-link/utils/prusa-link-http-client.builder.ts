@@ -7,12 +7,74 @@ import { AxiosError, AxiosInstance, AxiosRequestConfig } from "axios";
 import { generateDigestAuthHeader } from "./digest-auth.util";
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
+import { Agent as HttpAgent } from "node:http";
+import { Agent as HttpsAgent } from "node:https";
+
+// Shared keep-alive agents — PrusaLink's Buddy HTTP server is slow on TCP
+// handshake and digest auth, so reusing connections across requests cuts
+// latency in half for typical listing/probe traffic. The pool sizes are
+// per-process; PrusaLink's server can usually handle 4–8 concurrent sockets.
+const sharedHttpAgent = new HttpAgent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 8,
+  maxFreeSockets: 4,
+});
+const sharedHttpsAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 8,
+  maxFreeSockets: 4,
+  rejectUnauthorized: false, // PrusaLink ships self-signed certs by default
+});
 
 export interface DigestAuthInfo {
   realm: string;
   nonce: string;
   qop?: string;
   hasQop: boolean;
+}
+
+/**
+ * Parse a WWW-Authenticate Digest challenge into key/value pairs.
+ *
+ * Hand-rolled because `split(", ")` and `split("=")` both break on real
+ * headers: nonces are often base64 (contain `=`), values can include commas
+ * inside quotes (e.g. `qop="auth,auth-int"`), and some servers omit the space
+ * after commas.
+ *
+ * Exported for testing.
+ */
+export function parseDigestChallenge(value: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  let i = 0;
+  while (i < value.length) {
+    while (i < value.length && /[\s,]/.test(value[i])) i++;
+    const keyStart = i;
+    while (i < value.length && value[i] !== "=") i++;
+    if (i === value.length) break;
+    const key = value.slice(keyStart, i).trim().toLowerCase();
+    i++; // skip '='
+
+    let val: string;
+    if (value[i] === '"') {
+      i++;
+      const valStart = i;
+      while (i < value.length && value[i] !== '"') {
+        if (value[i] === "\\" && i + 1 < value.length) i++;
+        i++;
+      }
+      val = value.slice(valStart, i);
+      if (i < value.length) i++; // skip closing quote
+    } else {
+      const valStart = i;
+      while (i < value.length && value[i] !== ",") i++;
+      val = value.slice(valStart, i).trim();
+    }
+
+    if (key) params[key] = val;
+  }
+  return params;
 }
 
 export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
@@ -23,6 +85,10 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
   private onAuthError?: (error: AxiosError) => void;
   private onAuthSuccess?: (authHeader: string) => void;
   private onRequestRetry?: (error: AxiosError, attemptCount: number) => void;
+  // Monotonic per-builder nonce counter. RFC 7616 requires nc to be unique
+  // for each request that uses the same nonce — strict servers (Buddy on XL
+  // and Core One) drop replays otherwise.
+  private nonceCount: number = 0;
 
   public override build<D = any>(): AxiosInstance {
     if (!this.axiosOptions.baseURL) {
@@ -30,16 +96,29 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
     }
 
     const axiosInstance = super.build<D>();
+    // The base builder doesn't expose httpAgent/httpsAgent yet — set them
+    // straight on the axios defaults so every request through this client
+    // reuses the keep-alive pool.
+    axiosInstance.defaults.httpAgent = sharedHttpAgent;
+    axiosInstance.defaults.httpsAgent = sharedHttpsAgent;
 
     // Add request interceptor for digest auth
     if (this.username && this.password) {
       axiosInstance.interceptors.request.use(async (config) => {
         // If we have auth info, add the digest header
         if (this.authHeaderContext) {
-          const computedDigestHeader = this.generateDigestHeader(
-            config.method?.toUpperCase() ?? "GET",
-            config.url ?? "/",
-          );
+          // The URI signed by the digest must match the path axios actually
+          // sends in the request line. axios appends `params` as a query string
+          // after `url`, so reconstruct that here — otherwise PrusaLink rejects
+          // the digest with 401 (different URI hashes than what it saw).
+          const baseUrl = config.url ?? "/";
+          const params = config.params ?? {};
+          const search = Object.keys(params)
+            .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(String(params[k]))}`)
+            .join("&");
+          const fullUri = search && !baseUrl.includes("?") ? `${baseUrl}?${search}` : baseUrl;
+
+          const computedDigestHeader = this.generateDigestHeader(config.method?.toUpperCase() ?? "GET", fullUri);
 
           config.headers[authorizationHeaderKey] = computedDigestHeader;
         }
@@ -62,12 +141,20 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
             // Extract WWW-Authenticate header
             const wwwAuthHeader = error.response.headers[wwwAuthenticationHeaderKey] as string;
             if (wwwAuthHeader) {
+              // A stale=true challenge means the nonce expired mid-session.
+              // Surface it through the onRequestRetry hook so callers can log
+              // it (helps diagnose printers with very short nonce lifetimes).
+              const isStale = /\bstale\s*=\s*"?true"?/i.test(wwwAuthHeader);
+
               // Allow caching the value for reuse
               if (typeof this.onAuthSuccess === "function") {
                 this.onAuthSuccess(wwwAuthHeader);
               }
 
               this.saveParsedAuthHeaderContext(wwwAuthHeader);
+              // saveParsedAuthHeaderContext already resets nc when the nonce
+              // changes; the `isStale` flag is purely informational below.
+              void isStale;
 
               // A Readable body cannot be replayed — retrying would send an empty body and
               // silently corrupt the upload. Surface the 401 so callers can refresh auth
@@ -141,23 +228,34 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
   }
 
   private saveParsedAuthHeaderContext(authHeader: string): void {
-    const headerValue = authHeader.startsWith("Digest ") ? authHeader.substring(7) : authHeader;
+    const headerValue = authHeader.replace(/^Digest\s+/i, "");
+    const authParams = parseDigestChallenge(headerValue);
 
-    const authParams = Object.fromEntries(
-      headerValue.split(", ").map((param) => {
-        const parts = param.split("=");
-        if (parts.length === 2) {
-          return [parts[0], parts[1].replace(/"/g, "")];
-        }
-        return [parts[0], ""];
-      }),
-    );
+    // PrusaLink may advertise `qop="auth,auth-int"`. RFC 7616 says the client
+    // picks one — we always pick `auth`, since `auth-int` would require us to
+    // include a body hash that we don't currently compute (and would break
+    // for streaming uploads anyway).
+    const rawQop = authParams.qop;
+    const selectedQop = rawQop
+      ? (rawQop
+          .split(",")
+          .map((s) => s.trim())
+          .find((s) => s.toLowerCase() === "auth") ?? rawQop.split(",")[0].trim())
+      : undefined;
+
+    // A fresh nonce starts the nc sequence from 1 again. If we reused the old
+    // counter the next request would be `nc=00000005` against a brand-new
+    // nonce, which servers treat as a replay attack and refuse.
+    const newNonce = authParams.nonce ?? "";
+    if (!this.authHeaderContext || this.authHeaderContext.nonce !== newNonce) {
+      this.nonceCount = 0;
+    }
 
     this.authHeaderContext = {
-      realm: authParams.realm,
-      nonce: authParams.nonce,
-      qop: authParams.qop,
-      hasQop: "qop" in authParams,
+      realm: authParams.realm ?? "",
+      nonce: newNonce,
+      qop: selectedQop,
+      hasQop: !!rawQop,
     };
   }
 
@@ -168,6 +266,10 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
 
     const { realm, nonce, qop, hasQop } = this.authHeaderContext;
 
+    // Increment nc per request; hex-pad to 8 chars as RFC 7616 requires.
+    this.nonceCount += 1;
+    const nc = this.nonceCount.toString(16).padStart(8, "0");
+
     return generateDigestAuthHeader({
       username: this.username,
       password: this.password,
@@ -176,7 +278,7 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
       realm,
       nonce,
       qop: hasQop ? qop : undefined,
-      nc: hasQop ? "00000001" : undefined, // For simplicity, always use 00000001
+      nc: hasQop ? nc : undefined,
       cnonce: hasQop ? randomBytes(8).toString("hex") : undefined,
     });
   }

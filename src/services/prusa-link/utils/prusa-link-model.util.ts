@@ -22,18 +22,7 @@ export interface PrusaLinkModelInfo {
 
 // Models known to run Buddy firmware on a 32-bit board — they natively
 // decode `.bgcode`.
-const BGCODE_CAPABLE = [
-  "MK4S",
-  "MK4",
-  "MK3.9S",
-  "MK3.9",
-  "MK3.5S",
-  "MK3.5",
-  "XL",
-  "MINI+",
-  "MINI",
-  "CORE ONE",
-];
+const BGCODE_CAPABLE = ["MK4S", "MK4", "MK3.9S", "MK3.9", "MK3.5S", "MK3.5", "XL", "MINI+", "MINI", "CORE ONE"];
 
 // Models that run Marlin on an 8-bit Einsy board, even when reached through
 // PrusaLink (the Pi is a thin shim, not the printer brain). These cannot
@@ -51,7 +40,9 @@ const LEGACY_NO_BGCODE = ["MK3S+", "MK3S", "MK3", "MK2.5S", "MK2.5"];
  * `model: null, supportsBgcode: null` so callers can decide whether to fail
  * open or closed.
  */
-export function parsePrusaLinkModel(version: Pick<VersionDto, "text" | "hostname"> | null | undefined): PrusaLinkModelInfo {
+export function parsePrusaLinkModel(
+  version: Pick<VersionDto, "text" | "hostname"> | null | undefined,
+): PrusaLinkModelInfo {
   const raw = version?.text ?? null;
   const haystack = `${version?.text ?? ""} ${version?.hostname ?? ""}`.toUpperCase();
 

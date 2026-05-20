@@ -12,6 +12,7 @@ import { errorSummary } from "@/utils/error.utils";
 import { prusaLinkEvent } from "@/services/prusa-link/constants/prusalink.constants";
 import type { PrusaLinkEventDto } from "@/services/prusa-link/constants/prusalink-event.dto";
 import { WsMessage } from "@/services/octoprint/octoprint-websocket.adapter";
+import { AppConstants } from "@/server.constants";
 
 const defaultLog = { adapter: "prusa-link" };
 
@@ -24,6 +25,8 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
   lastMessageReceivedTimestamp: null | number;
   protected logger: LoggerService;
   private refreshPrinterCurrentInterval?: NodeJS.Timeout;
+  private pollInFlight: boolean = false;
+  private consecutiveAuthFailures: number = 0;
 
   private eventEmittingAllowed: boolean = true;
 
@@ -91,55 +94,142 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
   startPolling() {
     this.stopPolling(); // Ensure no duplicate intervals exist
 
-    this.logger.debug("Polling adapter starting, setting interval.", this.logMeta());
+    const intervalMs = this.resolvePollIntervalMs();
+    this.logger.debug(`Polling adapter starting at ${intervalMs}ms interval.`, this.logMeta());
 
-    this.refreshPrinterCurrentInterval = setInterval(async () => {
-      if (!this.printerId) {
-        this.logger.warn("Printer ID is not set, skipping status check.", this.logMeta());
-        this.stopPolling();
-        return;
+    this.refreshPrinterCurrentInterval = setInterval(() => {
+      void this.pollOnce();
+    }, intervalMs);
+  }
+
+  /**
+   * Read the env-configured polling cadence, clamped to a sane range so a
+   * typo can't melt the printer's HTTP server (e.g. `PRUSA_LINK_POLL_INTERVAL_MS=1`).
+   */
+  private resolvePollIntervalMs(): number {
+    const raw = process.env[AppConstants.PRUSA_LINK_POLL_INTERVAL_MS];
+    if (!raw) return AppConstants.defaultPrusaLinkPollIntervalMs;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) return AppConstants.defaultPrusaLinkPollIntervalMs;
+    return Math.min(AppConstants.maxPrusaLinkPollIntervalMs, Math.max(AppConstants.minPrusaLinkPollIntervalMs, parsed));
+  }
+
+  private async pollOnce(): Promise<void> {
+    if (!this.printerId) {
+      this.logger.warn("Printer ID is not set, skipping status check.", this.logMeta());
+      this.stopPolling();
+      return;
+    }
+
+    // PrusaLink's HTTP server is single-threaded and slow under digest auth.
+    // If the previous tick is still in flight, skip this one rather than
+    // stacking parallel requests that would all time out together.
+    if (this.pollInFlight) {
+      this.logger.debug("Previous PrusaLink poll still in flight, skipping tick.", this.logMeta());
+      return;
+    }
+    this.pollInFlight = true;
+
+    this.updateSocketState(SOCKET_STATE.opening);
+    try {
+      this.prusaLinkApi.login = {
+        printerURL: this.login.printerURL,
+        username: this.login.username,
+        password: this.login.password,
+        apiKey: "",
+        printerType: PrusaLinkType,
+      };
+      this.updateSocketState(SOCKET_STATE.authenticating);
+      // Run the three reads in parallel — Buddy's HTTP server is slow, but it
+      // does serve concurrent GETs, and this halves the wall-clock latency
+      // versus the previous sequential calls.
+      const [printerState, jobState, status] = await Promise.all([
+        this.prusaLinkApi.getPrinterState(),
+        this.prusaLinkApi.getJobState(),
+        this.prusaLinkApi.getStatus().catch(() => null),
+      ]);
+      this.updateSocketState(SOCKET_STATE.authenticated);
+      this.updateApiState(API_STATE.responding);
+      this.consecutiveAuthFailures = 0;
+
+      const linkState = printerState.state?.flags?.link_state;
+      if (linkState && linkState !== "PRINTING") {
+        printerState.state.text = linkState;
       }
 
-      this.updateSocketState(SOCKET_STATE.opening);
-      try {
-        this.prusaLinkApi.login = {
-          printerURL: this.login.printerURL,
-          username: this.login.username,
-          password: this.login.password,
-          apiKey: "",
-          printerType: PrusaLinkType,
-        };
-        this.updateSocketState(SOCKET_STATE.authenticating);
-        const printerState = await this.prusaLinkApi.getPrinterState();
-        // Only when PRINTING we avoid appending the flag
-        if (printerState.state.flags?.link_state && printerState.state.flags?.link_state !== "PRINTING") {
-          printerState.state.text = printerState.state.flags.link_state;
-        }
-        const jobState = await this.prusaLinkApi.getJobState();
-        this.updateSocketState(SOCKET_STATE.authenticated);
-        this.updateApiState(API_STATE.responding);
+      // Map PrusaLink's link_state to the boolean flag set the dashboard reads.
+      // The previous "operational = !error" shortcut hid genuine BUSY/ATTENTION
+      // states; we'd rather show what the printer actually reports.
+      const flags = printerState.state?.flags;
+      if (flags) {
+        const ls = (linkState ?? "").toUpperCase();
+        flags.operational = ls !== "ERROR";
+        flags.printing = ls === "PRINTING";
+        flags.paused = ls === "PAUSED";
+        flags.pausing = ls === "PAUSING";
+        flags.cancelling = ls === "STOPPED" || ls === "CANCELLING";
+        flags.error = ls === "ERROR" || ls === "ATTENTION";
+        flags.closedOnError = ls === "ERROR";
+        flags.ready = ls === "READY" || ls === "IDLE" || ls === "OPERATIONAL" || ls === "FINISHED";
+        flags.busy = ls === "BUSY";
+      }
 
-        // PrusaLink's OctoPrint-compat /api/printer returns operational:false while idle
-        // on Buddy firmware — the dashboard reads that as Offline. Normalize on success.
-        const flags = printerState.state.flags;
-        if (flags && !flags.error && !flags.closedOnError) {
-          flags.operational = true;
-        }
+      // Avoid `undefined * 100 = NaN` propagating to the dashboard.
+      const rawCompletion = jobState.progress?.completion;
+      const completion = typeof rawCompletion === "number" ? rawCompletion * 100 : null;
 
-        await this.emitEvent("current", {
-          ...printerState,
-          job: jobState.job,
-          progress: {
-            printTime: jobState.progress?.printTime,
-            printTimeLeft: jobState.progress?.printTimeLeft,
-            completion: jobState.progress?.completion * 100,
-          },
-        });
-      } catch (error) {
-        this.updateSocketState(SOCKET_STATE.error);
+      // Extra telemetry from /api/v1/status — z height, fans, axis positions,
+      // and an in-flight transfer indicator (handy while a print file is
+      // streaming up to the printer).
+      const richTelemetry = status?.printer
+        ? {
+            zHeight: (status.printer as any).axis_z ?? null,
+            fanHotend: status.printer.fan_hotend ?? null,
+            fanPrint: status.printer.fan_print ?? null,
+            speed: status.printer.speed ?? null,
+            flow: status.printer.flow ?? null,
+          }
+        : null;
+      const transfer = status?.transfer
+        ? {
+            id: status.transfer.id,
+            progress: status.transfer.progress,
+            bytes: status.transfer.data_transferred,
+            timeTransferring: status.transfer.time_transferring,
+          }
+        : null;
+      const freeSpace = status?.storage?.free_space ?? null;
+
+      await this.emitEvent("current", {
+        ...printerState,
+        job: jobState.job,
+        progress: {
+          printTime: jobState.progress?.printTime ?? null,
+          printTimeLeft: jobState.progress?.printTimeLeft ?? null,
+          completion,
+        },
+        telemetry: richTelemetry ?? (printerState as any).telemetry ?? null,
+        transfer,
+        freeSpace,
+      });
+    } catch (error) {
+      this.updateSocketState(SOCKET_STATE.error);
+
+      // Throttle log noise when the printer is unreachable or credentials are
+      // wrong — we'd otherwise spam the log every 5s. After 3 consecutive
+      // failures, only log once per minute.
+      const status = (error as any)?.response?.status;
+      const isAuthFailure = status === 401 || status === 403;
+      if (isAuthFailure) this.consecutiveAuthFailures++;
+      else this.consecutiveAuthFailures = 0;
+
+      const shouldLog = this.consecutiveAuthFailures <= 3 || this.consecutiveAuthFailures % 12 === 0;
+      if (shouldLog) {
         this.logger.error(`Failed to fetch PrusaLink status ${errorSummary(error)}`, this.logMeta());
       }
-    }, 5000);
+    } finally {
+      this.pollInFlight = false;
+    }
   }
 
   stopPolling() {

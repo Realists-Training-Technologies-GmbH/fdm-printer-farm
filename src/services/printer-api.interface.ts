@@ -15,6 +15,9 @@ export const uploadFileInputSchema = z.object({
   contentLength: z.number().int().positive(),
   startPrint: z.boolean(),
   uploadToken: z.string().optional(),
+  // Optional subfolder (display-name path) to upload into. PrusaLink honors
+  // this; other firmwares ignore it for now.
+  targetPath: z.string().optional(),
 });
 
 export type UploadFileInput = z.infer<typeof uploadFileInputSchema>;
@@ -139,6 +142,13 @@ export interface IPrinterApi {
   deleteFile(path: string): Promise<void>;
 
   deleteFolder(path: string): Promise<void>;
+
+  /**
+   * Create a folder at `path`. Implementations may throw
+   * `NotImplementedException` when the underlying firmware doesn't expose
+   * folder creation (e.g. plain OctoPrint).
+   */
+  createFolder?(path: string): Promise<void>;
 
   getSettings(): Promise<ServerConfigDto | SettingsDto>;
 

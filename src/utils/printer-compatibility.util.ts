@@ -66,9 +66,7 @@ export function getIncompatibilityReason(
     return null;
   }
 
-  const accepted = COMPATIBILITY[fileFormat as FileFormatType]
-    .map((t) => PRINTER_TYPE_LABEL[t])
-    .join(", ");
+  const accepted = COMPATIBILITY[fileFormat as FileFormatType].map((t) => PRINTER_TYPE_LABEL[t]).join(", ");
   const printerLabel = PRINTER_TYPE_LABEL[printerType] ?? `type ${printerType}`;
   return `Files in "${fileFormat}" format cannot be printed on a ${printerLabel} printer. Compatible printer types: ${accepted}.`;
 }
@@ -87,9 +85,7 @@ export function getCompatiblePrinterTypes(
  * Returns the file formats a printer type can natively accept.
  */
 export function getCompatibleFileFormats(printerType: PrinterType): FileFormatType[] {
-  return (Object.keys(COMPATIBILITY) as FileFormatType[]).filter((fmt) =>
-    COMPATIBILITY[fmt].includes(printerType),
-  );
+  return (Object.keys(COMPATIBILITY) as FileFormatType[]).filter((fmt) => COMPATIBILITY[fmt].includes(printerType));
 }
 
 export { PRINTER_TYPE_LABEL };

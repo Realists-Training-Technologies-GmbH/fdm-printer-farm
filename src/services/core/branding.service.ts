@@ -118,10 +118,7 @@ export class BrandingService {
 
   // ----- internals -----
 
-  private async applyToBundleDir(
-    distPath: string,
-    source: { path: string; format: LogoFormat },
-  ): Promise<void> {
+  private async applyToBundleDir(distPath: string, source: { path: string; format: LogoFormat }): Promise<void> {
     const imgDir = join(distPath, "img");
     const assetsDir = join(distPath, "assets");
 

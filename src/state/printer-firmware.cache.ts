@@ -3,16 +3,9 @@ import { LoggerService } from "@/handlers/logger";
 import { PrinterApiFactory } from "@/services/printer-api.factory";
 import { PrusaLinkType } from "@/services/printer-api.interface";
 import { PrinterCache } from "@/state/printer.cache";
-import {
-  parsePrusaLinkModel,
-  type PrusaLinkModelInfo,
-} from "@/services/prusa-link/utils/prusa-link-model.util";
+import { parsePrusaLinkModel, type PrusaLinkModelInfo } from "@/services/prusa-link/utils/prusa-link-model.util";
 import { PrusaLinkApi } from "@/services/prusa-link/prusa-link.api";
-import {
-  printerEvents,
-  type PrinterCreatedEvent,
-  type PrintersDeletedEvent,
-} from "@/constants/event.constants";
+import { printerEvents, type PrinterCreatedEvent, type PrintersDeletedEvent } from "@/constants/event.constants";
 import EventEmitter2 from "eventemitter2";
 import { errorSummary } from "@/utils/error.utils";
 
@@ -135,10 +128,7 @@ export class PrinterFirmwareCache {
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Firmware fetch timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    );
+    const timer = setTimeout(() => reject(new Error(`Firmware fetch timed out after ${timeoutMs}ms`)), timeoutMs);
     promise.then(
       (value) => {
         clearTimeout(timer);

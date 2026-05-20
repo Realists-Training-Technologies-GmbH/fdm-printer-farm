@@ -7,6 +7,7 @@ import {
   PartialReprintFileDto,
   PrinterType,
   PrusaLinkType,
+  ReprintState,
   UploadFileInput,
   uploadFileInputSchema,
 } from "@/services/printer-api.interface";
@@ -112,30 +113,47 @@ export class PrusaLinkApi implements IPrinterApi {
       }>;
     };
 
-    const encodeSegments = (p: string) =>
-      p.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-    // `/api/v1/files/{storage}` paginates and returns a small default page
-    // (10 items on current Buddy firmware), which silently hides folders past
-    // the first page. Ask for a large window — the firmware caps at its
-    // internal max, so over-asking is safe.
-    const listingQuery = "?offset=0&limit=1000";
-    const buildUrl = (encoded: string) =>
-      encoded
-        ? `/api/v1/files/${storage}/${encoded}${listingQuery}`
-        : `/api/v1/files/${storage}${listingQuery}`;
+    const encodeSegments = (p: string) => p.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+
+    // Paginate through `/api/v1/files/{storage}/{...path}`. The default page
+    // size on Buddy firmware is small (10 items) and the firmware caps the
+    // upper limit, so we walk offsets in `pageSize` chunks until a short page
+    // arrives — that's how PrusaLink signals end-of-listing. The hard cap
+    // protects against pathological cases (corrupt FAT entries looping).
+    const pageSize = 200;
+    const maxItems = 10_000;
+    const buildUrl = (encoded: string, offset: number) => {
+      const query = `?offset=${offset}&limit=${pageSize}`;
+      return encoded ? `/api/v1/files/${storage}/${encoded}${query}` : `/api/v1/files/${storage}${query}`;
+    };
+
+    const fetchAll = async (encoded: string): Promise<ListingResponse> => {
+      const accumulated: NonNullable<ListingResponse["children"]> = [];
+      let head: ListingResponse | undefined;
+      for (let offset = 0; offset < maxItems; offset += pageSize) {
+        const page = await this.client.get<ListingResponse>(buildUrl(encoded, offset));
+        if (!head) head = page.data;
+        const slice = page.data?.children ?? [];
+        accumulated.push(...slice);
+        // Short page → no more items. PrusaLink doesn't expose a total count
+        // header, so this is the only reliable end-of-listing signal.
+        if (slice.length < pageSize) break;
+      }
+      return { ...head, children: accumulated };
+    };
 
     const directEncoded = encodeSegments(relPath);
-    let response;
+    let response: ListingResponse;
     let resolvedEncodedParent = directEncoded;
     try {
-      response = await this.client.get<ListingResponse>(buildUrl(directEncoded));
+      response = await fetchAll(directEncoded);
     } catch {
       const shortRel = await this.resolveStoragePath(relPath, storage);
       resolvedEncodedParent = encodeSegments(shortRel);
-      response = await this.client.get<ListingResponse>(buildUrl(resolvedEncodedParent));
+      response = await fetchAll(resolvedEncodedParent);
     }
 
-    const children = response.data?.children ?? [];
+    const children = response.children ?? [];
     // The user navigated into `relPath` using display names, so build the
     // prefix from those (not the resolved short names) — otherwise a click
     // on `Produktion/subfile` would return as `PRODUK~1/...` and round-trip
@@ -162,9 +180,7 @@ export class PrusaLinkApi implements IPrinterApi {
     // in parallel for the files that are missing one. Cap to a reasonable
     // batch so a huge folder doesn't fan out into thousands of requests.
     const sizeFetchCap = 64;
-    const missingSize = baseItems
-      .filter((i) => !i.dir && i.size === null)
-      .slice(0, sizeFetchCap);
+    const missingSize = baseItems.filter((i) => !i.dir && i.size === null).slice(0, sizeFetchCap);
     if (missingSize.length > 0) {
       const sizes = await Promise.all(
         children
@@ -174,7 +190,7 @@ export class PrusaLinkApi implements IPrinterApi {
             const encodedChild = resolvedEncodedParent
               ? `${resolvedEncodedParent}/${encodeURIComponent(c.name)}`
               : encodeURIComponent(c.name);
-            return this.getFileRaw(encodedChild)
+            return this.getFileRaw(encodedChild, storage)
               .then((r) => r.data?.size ?? null)
               .catch(() => null);
           }),
@@ -213,27 +229,39 @@ export class PrusaLinkApi implements IPrinterApi {
         }
       });
 
+    // Walk pages lazily — stop as soon as we find the matching display_name
+    // in a parent. This makes deep folder lookups affordable on large USBs
+    // without paying for a full enumeration.
+    const pageSize = 200;
+    const maxItems = 10_000;
+
     const resolved: string[] = [];
     for (const segment of segments) {
       const parentEncoded = resolved.map(encodeURIComponent).join("/");
-      const url = parentEncoded
-        ? `/api/v1/files/${storage}/${parentEncoded}?offset=0&limit=1000`
-        : `/api/v1/files/${storage}?offset=0&limit=1000`;
+      const baseUrl = parentEncoded ? `/api/v1/files/${storage}/${parentEncoded}` : `/api/v1/files/${storage}`;
 
+      let matchName: string | null = null;
       try {
-        const response = await this.client.get<{
-          children?: Array<{ name: string; display_name?: string }>;
-        }>(url);
-        const match = response.data?.children?.find(
-          (c) => c.display_name === segment || c.name === segment,
-        );
-        resolved.push(match?.name ?? segment);
+        for (let offset = 0; offset < maxItems; offset += pageSize) {
+          const response = await this.client.get<{
+            children?: Array<{ name: string; display_name?: string }>;
+          }>(`${baseUrl}?offset=${offset}&limit=${pageSize}`);
+          const slice = response.data?.children ?? [];
+          const hit = slice.find((c) => c.display_name === segment || c.name === segment);
+          if (hit) {
+            matchName = hit.name;
+            break;
+          }
+          if (slice.length < pageSize) break;
+        }
       } catch {
-        // If the parent isn't listable for any reason, fall back to the user
-        // segment — at worst the downstream call gets a 404 instead of a
-        // silent mis-resolution.
-        resolved.push(segment);
+        // Fall through — keep matchName null so we use the user segment.
       }
+
+      // If the parent isn't listable, fall back to the user segment — at
+      // worst the downstream call gets a 404 instead of a silent
+      // mis-resolution.
+      resolved.push(matchName ?? segment);
     }
 
     return resolved.join("/");
@@ -263,11 +291,12 @@ export class PrusaLinkApi implements IPrinterApi {
     const resolved = await this.resolveEncodedPath(path);
     const response = await this.getFileRaw(resolved);
 
+    const isDir = (response.data.type ?? "").toUpperCase() === "FOLDER";
     return {
       path: response.data.display_name ?? response.data.name,
-      size: response.data.size,
+      size: response.data.size ?? null,
       date: response.data.m_timestamp ?? null,
-      dir: false,
+      dir: isDir,
       displayName: response.data.display_name ?? null,
     };
   }
@@ -289,55 +318,99 @@ export class PrusaLinkApi implements IPrinterApi {
     return response.data;
   }
 
-  connect(): Promise<void> {
-    throw new Error("Method not implemented.");
+  /**
+   * PrusaLink has no "connect" concept — the printer is reachable when the
+   * Buddy board is on and the HTTP server is up. Validate by hitting `/api/version`
+   * so the caller still gets a real error when the box is unreachable.
+   */
+  async connect(): Promise<void> {
+    await this.validateConnection();
   }
 
-  disconnect(): Promise<void> {
-    throw new Error("Method not implemented.");
+  /** PrusaLink has no "disconnect" — no-op so the dashboard doesn't 500. */
+  async disconnect(): Promise<void> {
+    // intentionally a no-op
   }
 
   restartServer(): Promise<void> {
-    throw new Error("Method not implemented.");
+    return Promise.reject(
+      new ExternalServiceError(
+        {
+          error: "Restarting the PrusaLink service over HTTP isn't supported — power-cycle the printer instead.",
+          statusCode: 501,
+          success: false,
+        },
+        "Prusa-Link",
+      ),
+    );
   }
 
   restartHost(): Promise<void> {
-    throw new Error("Method not implemented.");
+    return Promise.reject(
+      new ExternalServiceError(
+        {
+          error: "PrusaLink doesn't expose a host-reboot endpoint — power-cycle the printer manually.",
+          statusCode: 501,
+          success: false,
+        },
+        "Prusa-Link",
+      ),
+    );
   }
 
   restartPrinterFirmware(): Promise<void> {
-    throw new Error("Method not implemented.");
+    return Promise.reject(
+      new ExternalServiceError(
+        {
+          error:
+            "Restarting the printer firmware over PrusaLink isn't supported — reset the printer via the front panel.",
+          statusCode: 501,
+          success: false,
+        },
+        "Prusa-Link",
+      ),
+    );
   }
 
   async startPrint(path: string): Promise<void> {
+    // Refuse to enqueue a second print on top of an active one — PrusaLink
+    // would reply with a generic 409 and the user gets no useful feedback.
+    try {
+      const status = await this.getStatus();
+      const linkState = (status.printer?.state ?? "").toUpperCase();
+      const busyStates = new Set(["PRINTING", "PAUSED", "PAUSING", "BUSY", "ATTENTION"]);
+      if (status.job?.id || busyStates.has(linkState)) {
+        throw new ExternalServiceError(
+          {
+            error: "PrusaLink is busy with another job — cancel or wait for it to finish before starting a new print.",
+            statusCode: 409,
+            success: false,
+          },
+          "Prusa-Link",
+        );
+      }
+    } catch (e) {
+      // If the status probe fails for any non-ExternalServiceError reason we
+      // still try to start the print — the printer will reject it cleanly.
+      if (e instanceof ExternalServiceError) throw e;
+    }
+
     const resolved = await this.resolveEncodedPath(path);
     await this.client.post<void>(`/api/v1/files/usb/${resolved}`);
   }
 
   async pausePrint(): Promise<void> {
-    const jobId = await this.getCurrentJobId();
-    if (!jobId) {
-      this.logger.warn("Job pause command did not complete, job or job id not set");
-      return;
-    }
+    const jobId = await this.requireCurrentJobId("pause");
     await this.client.put<void>(`/api/v1/job/${jobId}/pause`);
   }
 
   async resumePrint(): Promise<void> {
-    const jobId = await this.getCurrentJobId();
-    if (!jobId) {
-      this.logger.warn("Job resume command did not complete, job or job id not set");
-      return;
-    }
+    const jobId = await this.requireCurrentJobId("resume");
     await this.client.put<void>(`/api/v1/job/${jobId}/resume`);
   }
 
   async cancelPrint(): Promise<void> {
-    const jobId = await this.getCurrentJobId();
-    if (!jobId) {
-      this.logger.warn("Job cancel command did not complete, job or job id not set");
-      return;
-    }
+    const jobId = await this.requireCurrentJobId("cancel");
     await this.client.delete<void>(`/api/v1/job/${jobId}`);
   }
 
@@ -383,7 +456,8 @@ export class PrusaLinkApi implements IPrinterApi {
     // long display name so browsers save the file with its original filename.
     if (displayName) {
       const safe = displayName.replace(/"/g, "");
-      response.headers["content-disposition"] = `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(displayName)}`;
+      response.headers["content-disposition"] =
+        `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(displayName)}`;
     }
 
     return response;
@@ -426,6 +500,36 @@ export class PrusaLinkApi implements IPrinterApi {
       }
     }
 
+    // Refuse the upload up-front if the USB is too small to hold the file.
+    // We treat status as best-effort — if the probe fails, let the actual PUT
+    // surface the error.
+    try {
+      const status = await this.getStatus();
+      const freeSpace = status.storage?.free_space;
+      if (typeof freeSpace === "number" && freeSpace > 0 && freeSpace < validated.contentLength) {
+        throw new ExternalServiceError(
+          {
+            error: `Not enough free space on the USB drive: needs ${validated.contentLength} bytes but only ${freeSpace} are available.`,
+            statusCode: 507,
+            data: { freeSpace, requiredBytes: validated.contentLength },
+            success: false,
+          },
+          "Prusa-Link",
+        );
+      }
+    } catch (e) {
+      if (e instanceof ExternalServiceError) throw e;
+    }
+
+    // Resolve the destination subfolder (if any) against display_name first
+    // so the PUT lands in the same folder the user is browsing.
+    const targetSubfolder = (validated.targetPath ?? "").replace(/^\/+|\/+$/g, "");
+    const subfolderResolved = targetSubfolder ? await this.resolveStoragePath(targetSubfolder) : "";
+    const subfolderEncoded = subfolderResolved.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    const uploadPath = subfolderEncoded
+      ? `/api/v1/files/usb/${subfolderEncoded}/${encodeURIComponent(validated.fileName)}`
+      : `/api/v1/files/usb/${encodeURIComponent(validated.fileName)}`;
+
     try {
       const response = await this.createClient((b) => {
         b.withHeaders({
@@ -440,7 +544,7 @@ export class PrusaLinkApi implements IPrinterApi {
               this.eventEmitter2.emit(`${uploadProgressEvent(validated.uploadToken)}`, validated.uploadToken, p);
             }
           });
-      }).put(`/api/v1/files/usb/${encodeURIComponent(validated.fileName)}`, validated.stream);
+      }).put(uploadPath, validated.stream);
 
       if (validated.uploadToken) {
         this.eventEmitter2.emit(`${uploadDoneEvent(validated.uploadToken)}`, validated.uploadToken);
@@ -452,24 +556,45 @@ export class PrusaLinkApi implements IPrinterApi {
         this.eventEmitter2.emit(
           `${uploadFailedEvent(validated.uploadToken)}`,
           validated.uploadToken,
-          (e as AxiosError)?.message,
+          (e as AxiosError)?.message ?? e?.message,
         );
       }
 
-      let data;
-      try {
-        data = JSON.parse(e.response?.body);
-      } catch {
-        data = e.response?.body;
+      // axios surfaces the error body on `response.data`, not `response.body`,
+      // and the HTTP status on `response.status`. Keep the resilient parse in
+      // case the body is a JSON string (some PrusaLink errors arrive that way).
+      const rawData = (e as AxiosError)?.response?.data;
+      let data: unknown = rawData;
+      if (typeof rawData === "string") {
+        try {
+          data = JSON.parse(rawData);
+        } catch {
+          data = rawData;
+        }
+      }
+
+      // Translate common PrusaLink upload failures into actionable messages.
+      const status = (e as AxiosError)?.response?.status;
+      let friendly = e?.message ?? "Upload failed";
+      if (status === 401) {
+        friendly = "PrusaLink rejected the upload: invalid username or password.";
+      } else if (status === 409) {
+        friendly = "PrusaLink rejected the upload: a file with that name already exists and overwrite was refused.";
+      } else if (status === 413) {
+        friendly = "PrusaLink rejected the upload: file is larger than the printer storage allows.";
+      } else if (status === 415) {
+        friendly = "PrusaLink rejected the upload: file format not supported by this firmware.";
+      } else if (status === 507) {
+        friendly = "PrusaLink rejected the upload: not enough free space on USB.";
       }
 
       throw new ExternalServiceError(
         {
-          error: e.message,
-          statusCode: e.response?.statusCode,
+          error: friendly,
+          statusCode: status,
           data,
           success: false,
-          stack: e.stack,
+          stack: e?.stack,
         },
         "Prusa-Link",
       );
@@ -486,21 +611,89 @@ export class PrusaLinkApi implements IPrinterApi {
     await this.client.delete<void>(`/api/v1/files/usb/${resolved}`);
   }
 
+  /**
+   * Create a folder on the USB storage. PrusaLink uses POST against the
+   * target path with the `Create-Folder: ?1` directive. The parent segments
+   * are resolved through display_name first so the request lands in the same
+   * place the user is browsing.
+   */
+  async createFolder(path: string): Promise<void> {
+    const trimmed = (path ?? "").replace(/^\/+|\/+$/g, "");
+    if (!trimmed) {
+      throw new ExternalServiceError(
+        { error: "Folder path is required.", statusCode: 400, success: false },
+        "Prusa-Link",
+      );
+    }
+
+    const segments = trimmed.split("/").filter(Boolean);
+    const newName = segments.pop()!;
+    const parentResolved = await this.resolveStoragePath(segments.join("/"));
+    const parentEncoded = parentResolved.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    const targetEncoded = parentEncoded
+      ? `${parentEncoded}/${encodeURIComponent(newName)}`
+      : encodeURIComponent(newName);
+
+    await this.createClient((b) => {
+      b.withHeaders({ "Create-Folder": "?1" });
+    }).post<void>(`/api/v1/files/usb/${targetEncoded}`);
+  }
+
   getSettings(): Promise<ServerConfigDto | SettingsDto> {
     throw new Error("Method not implemented.");
   }
 
-  getReprintState(): Promise<PartialReprintFileDto> {
-    throw new Error("Method not implemented.");
+  /**
+   * PrusaLink doesn't expose a "last print" snapshot — when no job is in
+   * flight, the `/api/v1/status.job` field disappears. Surface a benign
+   * "no last print" state instead of throwing so reprint UIs degrade gracefully.
+   */
+  async getReprintState(): Promise<PartialReprintFileDto> {
+    try {
+      const status = await this.getStatus();
+      const jobFile = (status as any).job?.file;
+      if (!jobFile?.path) {
+        return { reprintState: ReprintState.NoLastPrint, connectionState: null };
+      }
+      return {
+        reprintState: ReprintState.LastPrintReady,
+        connectionState: null,
+        file: {
+          path: jobFile.display_name ?? jobFile.path,
+          size: jobFile.size ?? null,
+          date: jobFile.m_timestamp ?? null,
+          dir: false,
+          displayName: jobFile.display_name ?? null,
+        },
+      };
+    } catch {
+      return { reprintState: ReprintState.PrinterNotAvailable, connectionState: null };
+    }
   }
 
-  private getFileRaw(path: string) {
-    return this.client.get<PL_FileDto>(`/api/v1/files/usb/${path}`);
+  private getFileRaw(path: string, storage = "usb") {
+    return this.client.get<PL_FileDto>(`/api/v1/files/${storage}/${path}`);
   }
 
   private async getCurrentJobId() {
     const status = await this.getStatus();
     return status.job?.id;
+  }
+
+  private async requireCurrentJobId(action: string): Promise<number> {
+    const jobId = await this.getCurrentJobId();
+    if (!jobId) {
+      this.logger.warn(`Cannot ${action} print: no active job on this printer`, this.logMeta());
+      throw new ExternalServiceError(
+        {
+          error: `Cannot ${action} print: no active job on this printer.`,
+          statusCode: 409,
+          success: false,
+        },
+        "Prusa-Link",
+      );
+    }
+    return jobId;
   }
 
   private createClient(buildFluentOptions?: (base: PrusaLinkHttpClientBuilder) => void) {

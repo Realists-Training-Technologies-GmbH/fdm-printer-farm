@@ -81,6 +81,14 @@ export const AppConstants = {
   debugSocketStatesKey: "DEBUG_SOCKET_STATES",
   defaultDebugSocketStates: "false",
 
+  // PrusaLink HTTP polling cadence (ms). Lower = fresher state but more load
+  // on the Buddy board. Overridable via PRUSA_LINK_POLL_INTERVAL_MS env var
+  // (clamped to [1000, 60000]).
+  PRUSA_LINK_POLL_INTERVAL_MS: "PRUSA_LINK_POLL_INTERVAL_MS",
+  defaultPrusaLinkPollIntervalMs: 5000,
+  minPrusaLinkPollIntervalMs: 1000,
+  maxPrusaLinkPollIntervalMs: 60_000,
+
   // MonsterPi
   monsterPiFilePath: "/etc/monsterpi_version",
 
