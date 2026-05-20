@@ -1,4 +1,8 @@
-import { parsePrusaLinkModel } from "@/services/prusa-link/utils/prusa-link-model.util";
+import {
+  arePrusaModelsCompatible,
+  getPrusaPrinterFamily,
+  parsePrusaLinkModel,
+} from "@/services/prusa-link/utils/prusa-link-model.util";
 
 describe("parsePrusaLinkModel", () => {
   it("flags MK4 as bgcode-capable", () => {
@@ -44,5 +48,71 @@ describe("parsePrusaLinkModel", () => {
   it("returns null model on missing input", () => {
     expect(parsePrusaLinkModel(null).model).toBeNull();
     expect(parsePrusaLinkModel(undefined).model).toBeNull();
+  });
+});
+
+describe("getPrusaPrinterFamily", () => {
+  it("groups MK4 and MK4S into the MK4 family", () => {
+    expect(getPrusaPrinterFamily("MK4")).toBe("MK4");
+    expect(getPrusaPrinterFamily("MK4S")).toBe("MK4");
+  });
+
+  it("groups MINI / MINI+ / MINIIS into the MINI family", () => {
+    expect(getPrusaPrinterFamily("MINI")).toBe("MINI");
+    expect(getPrusaPrinterFamily("MINI+")).toBe("MINI");
+    expect(getPrusaPrinterFamily("MINIIS")).toBe("MINI");
+    expect(getPrusaPrinterFamily("Original Prusa MINI+")).toBe("MINI");
+  });
+
+  it("groups any XL variant into XL", () => {
+    expect(getPrusaPrinterFamily("XL")).toBe("XL");
+    expect(getPrusaPrinterFamily("XL5")).toBe("XL");
+    expect(getPrusaPrinterFamily("Original Prusa XL 5 Toolheads")).toBe("XL");
+  });
+
+  it("separates MK3.5 / MK3.9 / MK3 (legacy) into distinct families", () => {
+    expect(getPrusaPrinterFamily("MK3.5")).toBe("MK3.5");
+    expect(getPrusaPrinterFamily("MK3.5S")).toBe("MK3.5");
+    expect(getPrusaPrinterFamily("MK3.9")).toBe("MK3.9");
+    expect(getPrusaPrinterFamily("MK3.9S")).toBe("MK3.9");
+    expect(getPrusaPrinterFamily("MK3S+")).toBe("MK3");
+    expect(getPrusaPrinterFamily("MK3")).toBe("MK3");
+  });
+
+  it("normalises Core One", () => {
+    expect(getPrusaPrinterFamily("Core One")).toBe("CORE_ONE");
+    expect(getPrusaPrinterFamily("COREONE")).toBe("CORE_ONE");
+  });
+
+  it("returns null for unrecognised input", () => {
+    expect(getPrusaPrinterFamily(null)).toBeNull();
+    expect(getPrusaPrinterFamily(undefined)).toBeNull();
+    expect(getPrusaPrinterFamily("")).toBeNull();
+    expect(getPrusaPrinterFamily("Foobar 9000")).toBeNull();
+  });
+});
+
+describe("arePrusaModelsCompatible", () => {
+  it("MINI-sliced file is rejected for an XL printer (the original bug)", () => {
+    expect(arePrusaModelsCompatible("MINI", "XL")).toBe(false);
+    expect(arePrusaModelsCompatible("MINI+", "XL")).toBe(false);
+  });
+
+  it("MK4-sliced file accepts MK4S printer (same family)", () => {
+    expect(arePrusaModelsCompatible("MK4", "MK4S")).toBe(true);
+  });
+
+  it("MK3.5 and MK3 are not the same family even if names overlap", () => {
+    expect(arePrusaModelsCompatible("MK3.5", "MK3S+")).toBe(false);
+    expect(arePrusaModelsCompatible("MK3", "MK3.5")).toBe(false);
+  });
+
+  it("fails open when either side is unknown", () => {
+    // No slicer model written → don't false-positive
+    expect(arePrusaModelsCompatible(null, "XL")).toBe(true);
+    // No printer model detected → don't block
+    expect(arePrusaModelsCompatible("MINI", null)).toBe(true);
+    // Slicer wrote something we don't recognise → don't block
+    expect(arePrusaModelsCompatible("Some Future Printer", "XL")).toBe(true);
   });
 });

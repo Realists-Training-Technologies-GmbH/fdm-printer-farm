@@ -16,6 +16,7 @@ import type { FileFormatType } from "@/entities/print-job.entity";
 import { PrusaLinkType, type PrinterType } from "@/services/printer-api.interface";
 import { getIncompatibilityReason } from "@/utils/printer-compatibility.util";
 import { PrinterFirmwareCache } from "@/state/printer-firmware.cache";
+import { arePrusaModelsCompatible, getPrusaPrinterFamily } from "@/services/prusa-link/utils/prusa-link-model.util";
 import { PrinterMaintenanceLogService } from "@/services/orm/printer-maintenance-log.service";
 
 @route(AppConstants.apiRoute + "/print-queue")
@@ -96,6 +97,7 @@ export class PrintQueueController {
 
     let fileFormat: FileFormatType | undefined;
     let resolvedFileName: string | undefined;
+    let slicerTargetModel: string | null = null;
 
     try {
       if (fileStorageId) {
@@ -106,6 +108,7 @@ export class PrintQueueController {
         const metadata = await this.fileStorageService.loadMetadata(fileStorageId);
         fileFormat = (metadata?.fileFormat as FileFormatType | undefined) ?? undefined;
         resolvedFileName = metadata?._originalFileName ?? metadata?.fileName;
+        slicerTargetModel = (metadata?.printerModel as string | null) ?? null;
       } else if (jobIdQuery) {
         const jobId = Number.parseInt(jobIdQuery, 10);
         if (Number.isNaN(jobId)) {
@@ -114,6 +117,7 @@ export class PrintQueueController {
         const job = await this.printJobService.getJobByIdOrFail(jobId);
         fileFormat = (job.fileFormat as FileFormatType | null) ?? undefined;
         resolvedFileName = job.fileName;
+        slicerTargetModel = job.printerModel ?? (job.metadata as any)?.printerModel ?? null;
       } else if (fileFormatQuery) {
         fileFormat = fileFormatQuery as FileFormatType;
       } else {
@@ -122,11 +126,12 @@ export class PrintQueueController {
 
       const allPrinters = await this.printerCache.listCachedPrinters(true);
 
-      // For .bgcode we need to dig deeper than printer type — legacy
-      // MK2.x/MK3/MK3S printers run Marlin on an 8-bit Einsy board and can't
-      // decode binary G-code even though PrusaLink fronts them. Warm the
-      // firmware cache in parallel for the PrusaLink set so this stays fast.
-      const needsModelCheck = fileFormat === "bgcode";
+      // We need the firmware cache warm whenever:
+      //   - the file is .bgcode (gate legacy 8-bit boards)
+      //   - the slicer wrote a printerModel (gate cross-family submissions
+      //     like a Mini-sliced gcode landing on an XL)
+      const fileFamily = getPrusaPrinterFamily(slicerTargetModel);
+      const needsModelCheck = fileFormat === "bgcode" || fileFamily !== null;
       if (needsModelCheck) {
         await Promise.all(
           allPrinters
@@ -155,12 +160,26 @@ export class PrintQueueController {
 
         if (needsModelCheck && printer.printerType === PrusaLinkType) {
           const info = this.printerFirmwareCache.getCachedInfoSync(printer.id);
-          if (info?.supportsBgcode === false) {
+          if (fileFormat === "bgcode" && info?.supportsBgcode === false) {
             const modelLabel = info.model ?? "this PrusaLink model";
             return {
               printer,
               compatible: false,
               reason: `Binary G-code (.bgcode) is only supported by 32-bit Buddy boards (MK4, MK3.9, MK3.5, XL, MINI+, Core One). ${modelLabel} runs Marlin on a legacy 8-bit board and cannot decode .bgcode — upload as plain .gcode instead.`,
+            };
+          }
+
+          // Cross-family guard: gcode sliced for a MINI shouldn't queue on an
+          // XL even though both are PrusaLink. We only apply this when the
+          // slicer wrote a model AND we successfully detected the printer's
+          // model — otherwise fail open so we don't false-positive on files
+          // sliced by tools that don't fill `printer_model`.
+          if (slicerTargetModel && !arePrusaModelsCompatible(slicerTargetModel, info?.model)) {
+            const printerLabel = info?.model ?? "this printer";
+            return {
+              printer,
+              compatible: false,
+              reason: `This file was sliced for ${slicerTargetModel}, but ${printerLabel} is a different model family. Re-slice for ${printerLabel} or pick a printer in the ${getPrusaPrinterFamily(slicerTargetModel)} family.`,
             };
           }
         }
@@ -171,6 +190,8 @@ export class PrintQueueController {
       res.send({
         fileFormat: fileFormat ?? null,
         fileName: resolvedFileName ?? null,
+        slicerTargetModel,
+        slicerTargetFamily: getPrusaPrinterFamily(slicerTargetModel),
         compatible: enriched.filter((p) => p.compatible).map((p) => p.printer),
         incompatible: enriched
           .filter((p) => !p.compatible)
@@ -241,6 +262,15 @@ export class PrintQueueController {
         incompatibleCount += 1;
         return false;
       }
+      // Cross-family guard for PrusaLink printers: hide files sliced for a
+      // different family (e.g. a MINI gcode mustn't show up on an XL).
+      if (printer.printerType === PrusaLinkType) {
+        const slicerTarget = (file.metadata?.printerModel as string | null) ?? null;
+        if (slicerTarget && !arePrusaModelsCompatible(slicerTarget, firmwareInfo?.model)) {
+          incompatibleCount += 1;
+          return false;
+        }
+      }
       return true;
     });
 
@@ -262,6 +292,9 @@ export class PrintQueueController {
         return {
           fileStorageId: file.fileStorageId,
           fileName: file.fileName,
+          // User-facing display name preserved from upload. Falls back to the
+          // stored fileName for legacy rows without metadata.
+          originalFileName: file.metadata?._originalFileName ?? file.fileName,
           fileFormat: file.fileFormat,
           fileSize: file.fileSize,
           fileHash: file.fileHash,
@@ -524,9 +557,11 @@ export class PrintQueueController {
 
       // .bgcode requires Buddy firmware on a 32-bit board. Block submission to
       // a legacy MK2.x/MK3/MK3S even though they show up as PrusaLink-typed.
-      if (fileFormat === "bgcode" && printer.printerType === PrusaLinkType) {
+      // Also catches the cross-family case (e.g. a MINI-sliced file landing
+      // on an XL): same printer type, different motion/heat profiles.
+      if (printer.printerType === PrusaLinkType) {
         const info = await this.printerFirmwareCache.getOrFetch(printerId);
-        if (info.supportsBgcode === false) {
+        if (fileFormat === "bgcode" && info.supportsBgcode === false) {
           const modelLabel = info.model ?? "this PrusaLink model";
           res.status(400).send({
             error: "Incompatible printer for this file",
@@ -534,6 +569,21 @@ export class PrintQueueController {
             fileFormat: metadata.fileFormat ?? null,
             printerType: printer.printerType,
             printerModel: info.model ?? null,
+          });
+          return;
+        }
+
+        const slicerTarget = (metadata.printerModel as string | null) ?? null;
+        if (slicerTarget && !arePrusaModelsCompatible(slicerTarget, info.model)) {
+          const printerLabel = info.model ?? "this printer";
+          res.status(400).send({
+            error: "Incompatible printer for this file",
+            message: `This file was sliced for ${slicerTarget}, but ${printerLabel} is a different model family. Re-slice for ${printerLabel} or pick a printer in the ${getPrusaPrinterFamily(slicerTarget)} family.`,
+            fileFormat: metadata.fileFormat ?? null,
+            printerType: printer.printerType,
+            printerModel: info.model ?? null,
+            slicerTargetModel: slicerTarget,
+            slicerTargetFamily: getPrusaPrinterFamily(slicerTarget),
           });
           return;
         }

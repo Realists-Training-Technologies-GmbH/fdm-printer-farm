@@ -69,3 +69,53 @@ function normalizeModelCasing(upper: string): string {
   if (upper === "CORE ONE") return "Core One";
   return upper;
 }
+
+/**
+ * Map any printer model string (firmware-reported or slicer-written) to a
+ * coarse "family" token. Two printers belong to the same family if they can
+ * print the same gcode without re-slicing — same kinematics, same build
+ * volume class, same firmware lineage.
+ *
+ * Returns `null` when the input has no recognisable family token; callers
+ * should treat that as "unknown, fail open".
+ *
+ * Families:
+ *   - "MK4"      — MK4, MK4S
+ *   - "MK3.9"    — MK3.9, MK3.9S (Buddy upgrade kit on MK3 frame)
+ *   - "MK3.5"    — MK3.5, MK3.5S
+ *   - "XL"       — XL (any tool count)
+ *   - "MINI"     — MINI, MINI+, MINIIS
+ *   - "CORE_ONE" — Core One
+ *   - "MK3"      — MK3S+, MK3S, MK3 (legacy 8-bit Einsy board)
+ *   - "MK2"      — MK2.5S, MK2.5, MK2S, MK2 (legacy)
+ */
+export function getPrusaPrinterFamily(model: string | null | undefined): string | null {
+  if (!model) return null;
+  const upper = model.toUpperCase().trim();
+  if (upper.includes("CORE ONE") || upper.includes("COREONE")) return "CORE_ONE";
+  if (upper.includes("XL")) return "XL";
+  // Buddy upgrade variants live on their own family — same gcode envelope but
+  // different motion/heat profiles than plain MK4/MK3 frames.
+  if (upper.includes("MK3.9")) return "MK3.9";
+  if (upper.includes("MK3.5")) return "MK3.5";
+  if (upper.includes("MK4")) return "MK4";
+  if (upper.includes("MINI")) return "MINI";
+  if (upper.includes("MK3")) return "MK3";
+  if (upper.includes("MK2")) return "MK2";
+  return null;
+}
+
+/**
+ * Decide whether a file sliced for `fileModel` can be sent to a printer
+ * identified as `printerModel`. Fails open (returns `true`) whenever either
+ * side is unknown — better than blocking the user when we have no signal.
+ */
+export function arePrusaModelsCompatible(
+  fileModel: string | null | undefined,
+  printerModel: string | null | undefined,
+): boolean {
+  const fileFamily = getPrusaPrinterFamily(fileModel);
+  const printerFamily = getPrusaPrinterFamily(printerModel);
+  if (!fileFamily || !printerFamily) return true;
+  return fileFamily === printerFamily;
+}
