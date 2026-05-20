@@ -101,7 +101,14 @@ export class ExceptionFilter {
       return;
     }
     if (err instanceof ExternalServiceError) {
-      res.status(500).send(err.error);
+      // Honour an explicit statusCode the adapter set on the error
+      // payload (e.g. 501 for "this firmware doesn't support jog") so
+      // the client can tell "not supported" apart from "actually broken".
+      const explicitStatus =
+        typeof err.error?.statusCode === "number" && err.error.statusCode >= 400 && err.error.statusCode < 600
+          ? err.error.statusCode
+          : 500;
+      res.status(explicitStatus).send(err.error);
       return;
     }
     if (err) {
