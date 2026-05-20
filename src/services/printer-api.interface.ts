@@ -18,6 +18,13 @@ export const uploadFileInputSchema = z.object({
   // Optional subfolder (display-name path) to upload into. PrusaLink honors
   // this; other firmwares ignore it for now.
   targetPath: z.string().optional(),
+  // Optional factory that produces a fresh readable stream of the same body.
+  // PrusaLink uses this to retry after a 401 priming pass — the original
+  // stream was already consumed (or rejected mid-flight) and can't be replayed.
+  // Implementations that don't need retries can omit it safely.
+  streamFactory: z
+    .custom<() => Readable>((val) => typeof val === "function", "Must be a function returning a stream")
+    .optional(),
 });
 
 export type UploadFileInput = z.infer<typeof uploadFileInputSchema>;
@@ -149,6 +156,20 @@ export interface IPrinterApi {
    * folder creation (e.g. plain OctoPrint).
    */
   createFolder?(path: string): Promise<void>;
+
+  /**
+   * List the cameras exposed by the printer (PrusaLink-only today). Returns
+   * an opaque array — the controller passes it through verbatim so the
+   * frontend can show whatever fields the firmware provides.
+   */
+  listCameras?(): Promise<unknown[]>;
+
+  /**
+   * Stream a snapshot JPEG from a camera attached to the printer. `cameraId`
+   * is the firmware-issued id from `listCameras`; when omitted the default
+   * camera is used (older firmware exposes only one).
+   */
+  getCameraSnapshot?(cameraId?: string): AxiosPromise<NodeJS.ReadableStream>;
 
   getSettings(): Promise<ServerConfigDto | SettingsDto>;
 

@@ -24,7 +24,7 @@ import type { IPrinterService } from "@/services/interfaces/printer.service.inte
 import type { LoginDto } from "@/services/interfaces/login.dto";
 import { AxiosError } from "axios";
 import { FailedDependencyException } from "@/exceptions/failed-dependency.exception";
-import { InternalServerException } from "@/exceptions/runtime.exceptions";
+import { ExternalServiceError, InternalServerException } from "@/exceptions/runtime.exceptions";
 import type { IPrinterApi } from "@/services/printer-api.interface";
 import { PrinterApiFactory } from "@/services/printer-api.factory";
 import { normalizeUrl } from "@/utils/normalize-url";
@@ -206,6 +206,46 @@ export class PrinterController {
   async homeAxes(req: Request, res: Response) {
     await this.printerApi.homeAxes(req.body);
     res.send({});
+  }
+
+  @GET()
+  @route("/:id/cameras")
+  async listPrinterCameras(req: Request, res: Response) {
+    if (typeof this.printerApi.listCameras !== "function") {
+      res.send([]);
+      return;
+    }
+    const cameras = await this.printerApi.listCameras();
+    res.send(cameras);
+  }
+
+  @GET()
+  @route("/:id/cameras/snapshot")
+  @route("/:id/cameras/:cameraId/snapshot")
+  async getPrinterCameraSnapshot(req: Request, res: Response) {
+    if (typeof this.printerApi.getCameraSnapshot !== "function") {
+      throw new ExternalServiceError(
+        {
+          error: "This printer type doesn't expose a board-attached camera over the API.",
+          statusCode: 501,
+          success: false,
+        },
+        "Prusa-Link",
+      );
+    }
+    const { cameraId } = req.params as { cameraId?: string };
+    const response = await this.printerApi.getCameraSnapshot(cameraId);
+    if (response.headers["content-type"]) {
+      res.setHeader("Content-Type", response.headers["content-type"]);
+    } else {
+      res.setHeader("Content-Type", "image/jpeg");
+    }
+    if (response.headers["content-length"]) {
+      res.setHeader("Content-Length", response.headers["content-length"]);
+    }
+    // Snapshots are point-in-time — no caching, no etags.
+    res.setHeader("Cache-Control", "no-store");
+    response.data.pipe(res);
   }
 
   @POST()

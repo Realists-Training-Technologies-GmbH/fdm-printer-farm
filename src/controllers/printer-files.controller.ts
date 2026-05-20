@@ -169,6 +169,10 @@ export class PrinterFilesController {
     await this.printerApi
       .uploadFile({
         stream: createReadStream(uploadedFile.path),
+        // Factory builds a fresh read stream on retry — multer leaves the file
+        // on disk until clearUploadedFile runs, so this is safe to call until
+        // the catch block tears the temp file down.
+        streamFactory: () => createReadStream(uploadedFile.path),
         fileName: uploadedFile.originalname,
         contentLength: uploadedFile.size,
         startPrint,

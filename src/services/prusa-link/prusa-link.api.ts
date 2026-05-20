@@ -82,7 +82,14 @@ export class PrusaLinkApi implements IPrinterApi {
 
   async getFiles(recursive = false, startDir = "/usb") {
     if (recursive) {
-      throw new Error("Recursive listing not supported for PrusaLink printers");
+      throw new ExternalServiceError(
+        {
+          error: "Recursive file listing isn't supported on PrusaLink — walk one folder at a time.",
+          statusCode: 501,
+          success: false,
+        },
+        "Prusa-Link",
+      );
     }
 
     // Use the modern PrusaLink endpoint `/api/v1/files/{storage}/{...path}`.
@@ -333,42 +340,20 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   restartServer(): Promise<void> {
-    return Promise.reject(
-      new ExternalServiceError(
-        {
-          error: "Restarting the PrusaLink service over HTTP isn't supported — power-cycle the printer instead.",
-          statusCode: 501,
-          success: false,
-        },
-        "Prusa-Link",
-      ),
+    return this.rejectUnsupported(
+      "Restarting the PrusaLink service over HTTP isn't supported — power-cycle the printer instead.",
     );
   }
 
   restartHost(): Promise<void> {
-    return Promise.reject(
-      new ExternalServiceError(
-        {
-          error: "PrusaLink doesn't expose a host-reboot endpoint — power-cycle the printer manually.",
-          statusCode: 501,
-          success: false,
-        },
-        "Prusa-Link",
-      ),
+    return this.rejectUnsupported(
+      "PrusaLink doesn't expose a host-reboot endpoint — power-cycle the printer manually.",
     );
   }
 
   restartPrinterFirmware(): Promise<void> {
-    return Promise.reject(
-      new ExternalServiceError(
-        {
-          error:
-            "Restarting the printer firmware over PrusaLink isn't supported — reset the printer via the front panel.",
-          statusCode: 501,
-          success: false,
-        },
-        "Prusa-Link",
-      ),
+    return this.rejectUnsupported(
+      "Restarting the printer firmware over PrusaLink isn't supported — reset the printer via the front panel.",
     );
   }
 
@@ -415,19 +400,21 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   quickStop(): Promise<void> {
-    throw new Error("Method not implemented.");
+    return this.rejectUnsupported("Emergency-stop over PrusaLink isn't supported. Use the printer's reset button.");
   }
 
-  sendGcode(script: string): Promise<void> {
-    throw new Error("Method not implemented.");
+  sendGcode(_script: string): Promise<void> {
+    return this.rejectUnsupported(
+      "Sending arbitrary G-code over PrusaLink isn't supported by the firmware. Send G-code via a slicer-uploaded file instead.",
+    );
   }
 
-  movePrintHead(amounts: { x?: number; y?: number; z?: number; speed?: number }): Promise<void> {
-    throw new Error("Method not implemented.");
+  movePrintHead(_amounts: { x?: number; y?: number; z?: number; speed?: number }): Promise<void> {
+    return this.rejectUnsupported("Jogging the print head over PrusaLink isn't supported by the firmware.");
   }
 
-  homeAxes(axes: { x?: boolean; y?: boolean; z?: boolean }): Promise<void> {
-    throw new Error("Method not implemented.");
+  homeAxes(_axes: { x?: boolean; y?: boolean; z?: boolean }): Promise<void> {
+    return this.rejectUnsupported("Homing axes over PrusaLink isn't supported by the firmware.");
   }
 
   async downloadFile(path: string): AxiosPromise<NodeJS.ReadableStream> {
@@ -530,8 +517,8 @@ export class PrusaLinkApi implements IPrinterApi {
       ? `/api/v1/files/usb/${subfolderEncoded}/${encodeURIComponent(validated.fileName)}`
       : `/api/v1/files/usb/${encodeURIComponent(validated.fileName)}`;
 
-    try {
-      const response = await this.createClient((b) => {
+    const buildUploadClient = () =>
+      this.createClient((b) => {
         b.withHeaders({
           "Content-Type": "application/octet-stream",
           "Content-Length": validated.contentLength.toString(),
@@ -544,7 +531,25 @@ export class PrusaLinkApi implements IPrinterApi {
               this.eventEmitter2.emit(`${uploadProgressEvent(validated.uploadToken)}`, validated.uploadToken, p);
             }
           });
-      }).put(uploadPath, validated.stream);
+      });
+
+    try {
+      let response;
+      try {
+        response = await buildUploadClient().put(uploadPath, validated.stream);
+      } catch (firstErr: any) {
+        // PrusaLink's digest interceptor refuses to replay a Readable body, so
+        // a first 401 leaves the connection un-authenticated. With a fresh
+        // stream we can retry exactly once — the auth header is now cached
+        // and the PUT goes through cleanly.
+        const status = (firstErr as AxiosError)?.response?.status;
+        if (status === 401 && typeof validated.streamFactory === "function") {
+          this.logger.debug("Upload hit a 401; retrying once with a fresh stream", this.logMeta());
+          response = await buildUploadClient().put(uploadPath, validated.streamFactory());
+        } else {
+          throw firstErr;
+        }
+      }
 
       if (validated.uploadToken) {
         this.eventEmitter2.emit(`${uploadDoneEvent(validated.uploadToken)}`, validated.uploadToken);
@@ -640,7 +645,31 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   getSettings(): Promise<ServerConfigDto | SettingsDto> {
-    throw new Error("Method not implemented.");
+    return this.rejectUnsupported(
+      "PrusaLink doesn't expose a settings document; check the printer's front panel instead.",
+    );
+  }
+
+  /**
+   * List cameras attached to the printer. Returns the firmware payload
+   * verbatim — the controller passes it through so the frontend can render
+   * whatever fields each PrusaLink version exposes.
+   */
+  async listCameras(): Promise<unknown[]> {
+    const response = await this.client.get<{ camera_list?: unknown[] } | unknown[]>("/api/v1/cameras");
+    const data = response.data as { camera_list?: unknown[] };
+    if (Array.isArray(data)) return data;
+    return data?.camera_list ?? [];
+  }
+
+  /**
+   * Stream a snapshot JPEG from a camera. When `cameraId` is omitted we hit
+   * `/api/v1/cameras/snap`, which Buddy maps to the default/first camera —
+   * convenient for printers with a single board-attached camera.
+   */
+  async getCameraSnapshot(cameraId?: string): AxiosPromise<NodeJS.ReadableStream> {
+    const path = cameraId ? `/api/v1/cameras/${encodeURIComponent(cameraId)}/snap` : `/api/v1/cameras/snap`;
+    return this.client.get(path, { responseType: "stream" });
   }
 
   /**
@@ -694,6 +723,15 @@ export class PrusaLinkApi implements IPrinterApi {
       );
     }
     return jobId;
+  }
+
+  /**
+   * Shared helper for endpoints the firmware simply doesn't expose. Returns a
+   * rejected promise (instead of throwing synchronously) so callers can use
+   * `await` and try/catch uniformly.
+   */
+  private rejectUnsupported(message: string): Promise<never> {
+    return Promise.reject(new ExternalServiceError({ error: message, statusCode: 501, success: false }, "Prusa-Link"));
   }
 
   private createClient(buildFluentOptions?: (base: PrusaLinkHttpClientBuilder) => void) {
