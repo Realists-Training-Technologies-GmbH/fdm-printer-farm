@@ -137,6 +137,31 @@ export class PrinterFilesController {
     res.send(printerThumbnail);
   }
 
+  @GET()
+  @route("/:id/firmware-thumbnail/:path")
+  @before(permission(PERMS.PrinterFiles.Get))
+  async getFirmwareThumbnail(req: Request, res: Response) {
+    if (typeof this.printerApi.getFileThumbnail !== "function") {
+      throw new ValidationException({
+        error: "Firmware-side thumbnails aren't supported on this printer type.",
+      });
+    }
+
+    const { path } = await validateInput(req.params, downloadFileSchema);
+    const variant = (req.query.variant as string) === "small" ? "small" : "big";
+    const encodedFilePath = path.split("/").map(encodeURIComponent).join("/");
+
+    const response = await this.printerApi.getFileThumbnail(encodedFilePath, variant);
+    res.setHeader("Content-Type", response.headers["content-type"] ?? "image/png");
+    if (response.headers["content-length"]) {
+      res.setHeader("Content-Length", response.headers["content-length"]);
+    }
+    // Thumbnails are cheap to refetch but stable per-file — let the browser
+    // cache them briefly so listing scrolls don't hammer the printer.
+    res.setHeader("Cache-Control", "private, max-age=300");
+    response.data.pipe(res);
+  }
+
   @POST()
   @route("/:id/upload")
   @before(permission(PERMS.PrinterFiles.Upload))

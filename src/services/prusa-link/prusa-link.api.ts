@@ -26,6 +26,7 @@ import EventEmitter2 from "eventemitter2";
 import type { PL_FileDto } from "@/services/prusa-link/dto/file.dto";
 import { SettingsStore } from "@/state/settings.store";
 import { parsePrusaLinkModel } from "@/services/prusa-link/utils/prusa-link-model.util";
+import { apiKeyHeaderKey } from "@/services/octoprint/constants/octoprint-service.constants";
 
 const defaultLog = { adapter: "prusa-link" };
 
@@ -673,6 +674,32 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   /**
+   * Stream the firmware-stored thumbnail for a file. We hit `/api/v1/files/usb/<path>`
+   * first to read the `refs.thumbnailSmall|thumbnailBig` URL the printer
+   * advertises, then stream that URL back. Falling back to the small variant
+   * when the big one isn't published keeps the call useful on every firmware.
+   */
+  async getFileThumbnail(path: string, variant: "small" | "big" = "big"): AxiosPromise<NodeJS.ReadableStream> {
+    const resolved = await this.resolveEncodedPath(path);
+    const file = await this.getFileRaw(resolved);
+    const refs = file.data?.refs as { thumbnailSmall?: string; thumbnailBig?: string } | undefined;
+    const url =
+      (variant === "big" ? refs?.thumbnailBig : refs?.thumbnailSmall) ?? refs?.thumbnailSmall ?? refs?.thumbnailBig;
+    if (!url) {
+      throw new ExternalServiceError(
+        {
+          error:
+            "PrusaLink doesn't have a thumbnail for this file — re-slice with thumbnails enabled or upload a .bgcode file.",
+          statusCode: 404,
+          success: false,
+        },
+        "Prusa-Link",
+      );
+    }
+    return this.client.get(url, { responseType: "stream" });
+  }
+
+  /**
    * PrusaLink doesn't expose a "last print" snapshot — when no job is in
    * flight, the `/api/v1/status.job` field disappears. Surface a benign
    * "no last print" state instead of throwing so reprint UIs degrade gracefully.
@@ -740,27 +767,44 @@ export class PrusaLinkApi implements IPrinterApi {
     return this.httpClientFactory.createClientWithBaseUrl(builder, this.printerLogin.printerURL, (b) => {
       this.logger.debug("Building API client", this.logMeta());
 
-      // Set up digest auth with the credentials and an error handler
-      b.withDigestAuth(
-        this.printerLogin.username,
-        this.printerLogin.password,
-        (error) => {
-          this.logger.error("Authentication error occurred", error);
-        },
-        (error, attemptCount) => {
-          this.logger.log(
-            `Authentication attempt count ${attemptCount} for method ${error.config?.method?.toUpperCase()} path ${error.config?.url}`,
-            this.logMeta(),
-          );
-        },
-        (authHeader) => {
-          this.logger.debug("Authentication successful, saving auth header for later reuse", this.logMeta());
-          this.authHeader = authHeader;
-        },
-      );
+      // Buddy firmware accepts two auth schemes:
+      //   - HTTP Digest with the username/password printed on the front-panel
+      //   - `X-Api-Key` with the "Printer API key" from front-panel → Network
+      // Prefer digest when both are present (it's the more privileged scheme
+      // and what existing setups already use); fall through to the API key
+      // when no password is configured.
+      const hasDigestCreds = !!this.printerLogin.username?.length && !!this.printerLogin.password?.length;
+      const hasApiKey = !!this.printerLogin.apiKey?.length;
 
-      if (this.authHeader) {
-        b.withAuthHeader(this.authHeader);
+      if (hasDigestCreds) {
+        b.withDigestAuth(
+          this.printerLogin.username,
+          this.printerLogin.password,
+          (error) => {
+            this.logger.error("Authentication error occurred", error);
+          },
+          (error, attemptCount) => {
+            this.logger.log(
+              `Authentication attempt count ${attemptCount} for method ${error.config?.method?.toUpperCase()} path ${error.config?.url}`,
+              this.logMeta(),
+            );
+          },
+          (authHeader) => {
+            this.logger.debug("Authentication successful, saving auth header for later reuse", this.logMeta());
+            this.authHeader = authHeader;
+          },
+        );
+
+        if (this.authHeader) {
+          b.withAuthHeader(this.authHeader);
+        }
+      } else if (hasApiKey) {
+        b.withHeaders({ [apiKeyHeaderKey]: this.printerLogin.apiKey! });
+      } else {
+        this.logger.warn(
+          "No credentials configured for PrusaLink printer — requests will be unauthenticated",
+          this.logMeta(),
+        );
       }
 
       if (buildFluentOptions && typeof buildFluentOptions === "function") {

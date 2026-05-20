@@ -171,6 +171,14 @@ export interface IPrinterApi {
    */
   getCameraSnapshot?(cameraId?: string): AxiosPromise<NodeJS.ReadableStream>;
 
+  /**
+   * Stream the firmware-stored thumbnail for a file on the printer. PrusaLink
+   * exposes small (~16-24px) and big (~220px) variants embedded in .bgcode /
+   * sliced .gcode files. Useful as a fallback when the server hasn't
+   * analyzed the file locally.
+   */
+  getFileThumbnail?(path: string, variant?: "small" | "big"): AxiosPromise<NodeJS.ReadableStream>;
+
   getSettings(): Promise<ServerConfigDto | SettingsDto>;
 
   getReprintState(): Promise<PartialReprintFileDto>;

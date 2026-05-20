@@ -1,5 +1,42 @@
 # Develop
 
+## PrusaLink
+
+### Features
+
+- Create folders on a PrusaLink printer: `POST /api/v2/printer-files/:id/folders`
+- Upload to a subfolder via the optional `targetPath` field on the upload form
+- Stream board-attached camera snapshots: `GET /api/v2/printer/:id/cameras`,
+  `GET /api/v2/printer/:id/cameras/snapshot`,
+  `GET /api/v2/printer/:id/cameras/:cameraId/snapshot`
+- Stream firmware-side thumbnails for files on the USB stick:
+  `GET /api/v2/printer-files/:id/firmware-thumbnail/:path?variant=big|small`
+- Configurable polling cadence via `PRUSA_LINK_POLL_INTERVAL_MS`
+  (default 5000ms, clamped to [1000, 60000])
+- API-key authentication: when only `apiKey` is configured, the client uses
+  the `X-Api-Key` header instead of HTTP Digest
+
+### Fixes
+
+- Tolerant Digest challenge parser (handles base64 nonces, `qop="auth,auth-int"`,
+  missing-space variants) and per-request `nc` counter — strict Buddy firmwares
+  no longer reject the cached auth header
+- Keep-alive HTTP/HTTPS agents reuse connections across requests
+- `pause`/`resume`/`cancel` now return 409 when no job is active instead of
+  silently warning
+- Upload retries once with a fresh stream factory after the initial 401
+  digest-priming round
+- Paginate `/api/v1/files` listings (page size 200, hard cap 10k items) to
+  avoid OOM on large USB sticks
+- Active-job and free-space pre-checks before `startPrint` and uploads
+- `link_state` mapped to flags correctly (no more forced
+  `operational: true` hiding `BUSY`/`ATTENTION` states); telemetry surface
+  now includes z-height, fan speeds, transfer state and free space
+- `restartServer`, `restartHost`, `restartPrinterFirmware`, `sendGcode`,
+  `movePrintHead`, `homeAxes`, `quickStop`, `getSettings`, and recursive
+  listings reject with `ExternalServiceError 501` and actionable messages
+  instead of throwing `Method not implemented` Errors
+
 # FDM Monster 2.0.11
 
 ## Features
