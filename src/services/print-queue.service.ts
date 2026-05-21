@@ -26,6 +26,11 @@ export interface QueuedJob {
   // preview, layer/filament metadata) without an extra round-trip per
   // queue row.
   fileStorageId?: string | null;
+  // Set when the job points at a file living on the printer's USB
+  // storage (not in File Storage). The UI uses these to fetch a
+  // firmware-side thumbnail instead of the file-storage one.
+  usbFilePath?: string | null;
+  usbDisplayName?: string | null;
   fileFormat?: string | null;
   fileSize?: number | null;
   thumbnails?: Array<{ index: number; width: number; height: number; format: string; size: number }>;
@@ -210,6 +215,8 @@ export class PrintQueueService implements IPrintQueueService {
         // Extra fields so the UI can render a "next up" hero card
         // (thumbnail + metadata) without per-row fetches.
         fileStorageId: j.fileStorageId ?? null,
+        usbFilePath: (j as any).usbFilePath ?? null,
+        usbDisplayName: (j as any).usbDisplayName ?? null,
         fileFormat: j.fileFormat ?? null,
         fileSize: j.fileSize ?? null,
         thumbnails,
