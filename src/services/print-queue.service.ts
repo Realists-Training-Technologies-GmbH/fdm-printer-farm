@@ -20,8 +20,19 @@ export interface QueuedJob {
   queuePosition: number;
   status: string;
   estimatedTimeSeconds?: number;
-  filamentGrams?: number;
+  filamentGrams?: number | number[];
   createdAt: Date;
+  // Surfaced so the UI can render the next-up item richly (thumbnail
+  // preview, layer/filament metadata) without an extra round-trip per
+  // queue row.
+  fileStorageId?: string | null;
+  fileFormat?: string | null;
+  fileSize?: number | null;
+  thumbnails?: Array<{ index: number; width: number; height: number; format: string; size: number }>;
+  layerHeight?: number | null;
+  totalLayers?: number | null;
+  printerModel?: string | null;
+  filamentType?: string | null;
 }
 
 export interface IPrintQueueService {
@@ -72,6 +83,7 @@ export class PrintQueueService implements IPrintQueueService {
         jobId: number;
         fileName: string;
         fileStorageId?: string;
+        usbFilePath?: string;
         queuePosition?: number | null;
       }) => {
         this.handleJobSubmission(
@@ -79,6 +91,7 @@ export class PrintQueueService implements IPrintQueueService {
           event.jobId,
           event.fileName,
           event.fileStorageId,
+          event.usbFilePath,
           event.queuePosition,
         ).catch((error) => {
           this.logger.error(`Failed to handle job submission for job ${event.jobId}`, error);
@@ -173,15 +186,39 @@ export class PrintQueueService implements IPrintQueueService {
       order: { queuePosition: "ASC" },
     });
 
-    return jobs.map((j) => ({
-      id: j.id,
-      fileName: j.fileName,
-      queuePosition: j.queuePosition!,
-      status: j.status,
-      estimatedTimeSeconds: (j.metadata as any)?.gcodePrintTimeSeconds,
-      filamentGrams: (j.metadata as any)?.filamentUsedGrams,
-      createdAt: j.createdAt,
-    }));
+    return jobs.map((j) => {
+      const md = (j.metadata as any) ?? {};
+      const thumbnails = Array.isArray(md._thumbnails)
+        ? md._thumbnails.map((t: any) => ({
+            index: t.index,
+            width: t.width,
+            height: t.height,
+            format: t.format,
+            size: t.size,
+          }))
+        : Array.isArray((j as any).thumbnails)
+          ? (j as any).thumbnails
+          : undefined;
+      return {
+        id: j.id,
+        fileName: j.fileName,
+        queuePosition: j.queuePosition!,
+        status: j.status,
+        estimatedTimeSeconds: md.gcodePrintTimeSeconds,
+        filamentGrams: md.filamentUsedGrams,
+        createdAt: j.createdAt,
+        // Extra fields so the UI can render a "next up" hero card
+        // (thumbnail + metadata) without per-row fetches.
+        fileStorageId: j.fileStorageId ?? null,
+        fileFormat: j.fileFormat ?? null,
+        fileSize: j.fileSize ?? null,
+        thumbnails,
+        layerHeight: md.layerHeight ?? null,
+        totalLayers: md.totalLayers ?? null,
+        printerModel: md.printerModel ?? null,
+        filamentType: md.filamentType ?? null,
+      };
+    });
   }
 
   async getGlobalQueuePaged(page: number, pageSize: number): Promise<[PrintJob[], number]> {
@@ -343,6 +380,7 @@ export class PrintQueueService implements IPrintQueueService {
       jobId: job.id,
       fileName: job.fileName,
       fileStorageId: job.fileStorageId,
+      usbFilePath: job.usbFilePath,
       queuePosition,
     });
   }
@@ -351,27 +389,36 @@ export class PrintQueueService implements IPrintQueueService {
     printerId: number,
     jobId: number,
     fileName: string,
-    fileStorageId?: string,
+    fileStorageId: string | null | undefined,
+    usbFilePath: string | null | undefined,
     queuePosition?: number | null,
   ): Promise<void> {
     this.logger.log(`Handling job submission for job ${jobId} on printer ${printerId}`);
 
     try {
-      if (!fileStorageId) {
-        throw new Error(`Job ${jobId} has no fileStorageId - cannot submit to printer`);
-      }
       const printerApi = this.printerApiFactory.getById(printerId);
 
-      const fileSize = this.fileStorageService.getFileSize(fileStorageId);
-      const fileStream = this.fileStorageService.readFileStream(fileStorageId);
+      if (usbFilePath) {
+        // File already lives on the printer's storage — just tell the firmware
+        // to start it. Mirrors the per-segment encoding the legacy USB-print
+        // controller uses so PrusaLink/OctoPrint accept paths with spaces.
+        const encodedPath = usbFilePath.split("/").map(encodeURIComponent).join("/");
+        this.logger.log(`Starting print of USB file ${usbFilePath} on printer ${printerId}`);
+        await printerApi.startPrint(encodedPath);
+      } else if (fileStorageId) {
+        const fileSize = this.fileStorageService.getFileSize(fileStorageId);
+        const fileStream = this.fileStorageService.readFileStream(fileStorageId);
 
-      this.logger.log(`Uploading file ${fileName} to printer ${printerId} and starting print`);
-      await printerApi.uploadFile({
-        stream: fileStream,
-        fileName,
-        contentLength: fileSize,
-        startPrint: true,
-      });
+        this.logger.log(`Uploading file ${fileName} to printer ${printerId} and starting print`);
+        await printerApi.uploadFile({
+          stream: fileStream,
+          fileName,
+          contentLength: fileSize,
+          startPrint: true,
+        });
+      } else {
+        throw new Error(`Job ${jobId} has neither fileStorageId nor usbFilePath - cannot submit to printer`);
+      }
       this.logger.log(`Successfully submitted job ${jobId} to printer ${printerId}`);
 
       if (queuePosition !== null && queuePosition !== undefined) {
