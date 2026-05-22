@@ -10,29 +10,41 @@ import { Readable } from "node:stream";
 import { Agent as HttpAgent } from "node:http";
 import { Agent as HttpsAgent } from "node:https";
 
-// Shared keep-alive agents — PrusaLink's Buddy HTTP server is slow on TCP
-// handshake and digest auth, so reusing connections across requests cuts
-// latency in half for typical listing/probe traffic. The pool sizes are
-// per-process; PrusaLink's server can usually handle 4–8 concurrent sockets.
-const sharedHttpAgent = new HttpAgent({
-  keepAlive: true,
-  keepAliveMsecs: 30_000,
-  maxSockets: 8,
-  maxFreeSockets: 4,
-});
-const sharedHttpsAgent = new HttpsAgent({
-  keepAlive: true,
-  keepAliveMsecs: 30_000,
-  maxSockets: 8,
-  maxFreeSockets: 4,
-  rejectUnauthorized: false, // PrusaLink ships self-signed certs by default
-});
+// Per-builder keep-alive agents with maxSockets: 1.
+//
+// The standalone PrusaLink on a Raspberry Pi (MK3/MK2.5) binds the digest
+// nonce to the TCP connection it was issued on. With a *shared* pool the
+// 401 challenge could land on socket A and the authenticated retry on
+// socket B, so the nonce was invalid and the request 401'd — intermittently,
+// depending on which pooled socket each leg grabbed.
+//
+// Pinning each printer's client to a single keep-alive socket guarantees the
+// challenge and its retry (and subsequent nc-incremented requests) ride the
+// same connection. Reads are already serialised per printer, so a single
+// socket costs no throughput; different printers get different builders and
+// therefore different sockets, so they still poll concurrently.
+function makeHttpAgent() {
+  return new HttpAgent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 1, maxFreeSockets: 1 });
+}
+function makeHttpsAgent() {
+  return new HttpsAgent({
+    keepAlive: true,
+    keepAliveMsecs: 30_000,
+    maxSockets: 1,
+    maxFreeSockets: 1,
+    rejectUnauthorized: false, // PrusaLink ships self-signed certs by default
+  });
+}
 
 export interface DigestAuthInfo {
   realm: string;
   nonce: string;
   qop?: string;
   hasQop: boolean;
+  /** "MD5" | "MD5-sess" etc. from the challenge (drives HA1 derivation). */
+  algorithm?: string;
+  /** Opaque token from the challenge; echoed back verbatim. */
+  opaque?: string;
 }
 
 /**
@@ -90,17 +102,21 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
   // and Core One) drop replays otherwise.
   private nonceCount: number = 0;
 
+  // One agent pair per builder so this client owns its single keep-alive
+  // socket (see makeHttpAgent rationale above).
+  private readonly httpAgent = makeHttpAgent();
+  private readonly httpsAgent = makeHttpsAgent();
+
   public override build<D = any>(): AxiosInstance {
     if (!this.axiosOptions.baseURL) {
       throw new Error("Base URL is required");
     }
 
     const axiosInstance = super.build<D>();
-    // The base builder doesn't expose httpAgent/httpsAgent yet — set them
-    // straight on the axios defaults so every request through this client
-    // reuses the keep-alive pool.
-    axiosInstance.defaults.httpAgent = sharedHttpAgent;
-    axiosInstance.defaults.httpsAgent = sharedHttpsAgent;
+    // Pin this client to its own single-socket agents so the digest
+    // challenge and its authenticated retry always share one connection.
+    axiosInstance.defaults.httpAgent = this.httpAgent;
+    axiosInstance.defaults.httpsAgent = this.httpsAgent;
 
     // Add request interceptor for digest auth
     if (this.username && this.password) {
@@ -256,6 +272,8 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
       nonce: newNonce,
       qop: selectedQop,
       hasQop: !!rawQop,
+      algorithm: authParams.algorithm,
+      opaque: authParams.opaque,
     };
   }
 
@@ -264,11 +282,16 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
       throw new Error("Digest auth not properly configured");
     }
 
-    const { realm, nonce, qop, hasQop } = this.authHeaderContext;
+    const { realm, nonce, qop, hasQop, algorithm, opaque } = this.authHeaderContext;
 
     // Increment nc per request; hex-pad to 8 chars as RFC 7616 requires.
     this.nonceCount += 1;
     const nc = this.nonceCount.toString(16).padStart(8, "0");
+
+    // A client nonce is required when qop is present *or* the algorithm is
+    // a "-sess" variant (the session HA1 mixes in cnonce).
+    const isSess = (algorithm ?? "").toLowerCase().endsWith("-sess");
+    const cnonce = hasQop || isSess ? randomBytes(8).toString("hex") : undefined;
 
     return generateDigestAuthHeader({
       username: this.username,
@@ -279,7 +302,9 @@ export class PrusaLinkHttpClientBuilder extends DefaultHttpClientBuilder {
       nonce,
       qop: hasQop ? qop : undefined,
       nc: hasQop ? nc : undefined,
-      cnonce: hasQop ? randomBytes(8).toString("hex") : undefined,
+      cnonce,
+      algorithm,
+      opaque,
     });
   }
 }

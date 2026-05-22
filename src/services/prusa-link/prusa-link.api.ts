@@ -58,6 +58,13 @@ export class PrusaLinkApi implements IPrinterApi {
     this.printerLogin = login;
   }
 
+  // NOTE: a fresh client per request is intentional. This box exposes two
+  // digest realms — "Administrator" (MD5-sess, native /api/version &
+  // /api/v1/*) and "Printer API" (plain, OctoPrint-compat /api/printer &
+  // /api/job). A single reused client can only hold one parsed challenge
+  // context, so reusing it across endpoints made requests get signed with
+  // the wrong realm and 401. Building per request lets each one run its own
+  // 401 → challenge → retry against the realm that endpoint actually uses.
   private get client() {
     return this.createClient();
   }
@@ -806,7 +813,9 @@ export class PrusaLinkApi implements IPrinterApi {
           this.printerLogin.username,
           this.printerLogin.password,
           (error) => {
-            this.logger.error("Authentication error occurred", error);
+            this.logger.error(
+              `Authentication error occurred for ${this.printerLogin?.printerURL}: ${error?.message}`,
+            );
           },
           (error, attemptCount) => {
             this.logger.log(
@@ -845,6 +854,6 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   private logMeta() {
-    return defaultLog;
+    return { ...defaultLog, printerURL: this.printerLogin?.printerURL };
   }
 }
