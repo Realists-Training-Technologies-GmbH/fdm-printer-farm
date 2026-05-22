@@ -815,14 +815,20 @@ export class PrusaLinkApi implements IPrinterApi {
             );
           },
           (authHeader) => {
-            this.logger.debug("Authentication successful, saving auth header for later reuse", this.logMeta());
+            this.logger.debug("Authentication successful", this.logMeta());
             this.authHeader = authHeader;
           },
         );
 
-        if (this.authHeader) {
-          b.withAuthHeader(this.authHeader);
-        }
+        // NOTE: we intentionally do NOT pre-seed the builder with a cached
+        // Authorization header. Each `createClient()` builds a fresh builder
+        // with its own per-nonce request counter (`nc`) starting at 1.
+        // Reusing a cached header across builders means several requests send
+        // `nc=00000001` against the same nonce — which the standalone
+        // PrusaLink on a Raspberry Pi (MK3/MK2.5) strictly validates and 401s
+        // as a replay. Letting every request run its own 401 → challenge →
+        // retry handshake gives each one a fresh server nonce, so `nc=1` is
+        // always valid. The extra round-trip is negligible at a 5s poll.
       } else if (hasApiKey) {
         b.withHeaders({ [apiKeyHeaderKey]: this.printerLogin.apiKey! });
       } else {
