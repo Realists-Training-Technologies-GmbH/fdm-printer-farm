@@ -140,14 +140,17 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
         printerType: PrusaLinkType,
       };
       this.updateSocketState(SOCKET_STATE.authenticating);
-      // Run the three reads in parallel — Buddy's HTTP server is slow, but it
-      // does serve concurrent GETs, and this halves the wall-clock latency
-      // versus the previous sequential calls.
-      const [printerState, jobState, status] = await Promise.all([
-        this.prusaLinkApi.getPrinterState(),
-        this.prusaLinkApi.getJobState(),
-        this.prusaLinkApi.getStatus().catch(() => null),
-      ]);
+      // These reads run sequentially on purpose. HTTP Digest auth uses a
+      // per-nonce request counter (`nc`) that must increase monotonically;
+      // firing the three GETs concurrently makes them race on the shared
+      // counter. Buddy firmware (MK4) tolerates out-of-order nc, but the
+      // standalone PrusaLink on a Raspberry Pi (MK3/MK2.5) validates it
+      // strictly and 401s whichever request loses the race. Serialising
+      // keeps the nc sequence clean for every PrusaLink variant; the
+      // latency cost is a few tens of ms per 5s poll.
+      const printerState = await this.prusaLinkApi.getPrinterState();
+      const jobState = await this.prusaLinkApi.getJobState();
+      const status = await this.prusaLinkApi.getStatus().catch(() => null);
       this.updateSocketState(SOCKET_STATE.authenticated);
       this.updateApiState(API_STATE.responding);
       this.consecutiveAuthFailures = 0;
