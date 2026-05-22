@@ -28,6 +28,7 @@ import { RenameGroupToTag1767432108916 } from "@/migrations/1767432108916-Rename
 import { AddPrintJob1767451444137 } from "@/migrations/1767451444137-AddPrintJob";
 import { AddPrinterMaintenanceLog1767909428129 } from "@/migrations/1767909428129-AddPrinterMaintenanceLog";
 import { AddFileStorageFolder1779456000000 } from "@/migrations/1779456000000-AddFileStorageFolder";
+import { AddUsbFileToPrintJob1779600000000 } from "@/migrations/1779600000000-AddUsbFileToPrintJob";
 
 const databaseFilePath = getDatabaseFilePath();
 
@@ -70,6 +71,7 @@ export const AppDataSource = new DataSource({
     AddPrintJob1767451444137,
     AddPrinterMaintenanceLog1767909428129,
     AddFileStorageFolder1779456000000,
+    AddUsbFileToPrintJob1779600000000,
   ],
   subscribers: [],
 });

@@ -184,6 +184,16 @@ export class PrintJob {
   @Column({ type: "varchar", nullable: true })
   fileHash: string | null; // SHA256 for deduplication
 
+  // USB / printer-storage source. When set, the job prints a file that already
+  // lives on the printer rather than one uploaded from File Storage. The path
+  // is the printer-addressable path (e.g. `usb/foo.bgcode`); display name is
+  // the friendly label PrusaLink returns for FAT 8.3 truncations.
+  @Column({ type: "varchar", nullable: true })
+  usbFilePath: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  usbDisplayName: string | null;
+
   // Timestamps
   @CreateDateColumn()
   createdAt: Date;

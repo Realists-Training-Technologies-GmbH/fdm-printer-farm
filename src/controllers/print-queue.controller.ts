@@ -12,7 +12,7 @@ import type { ILoggerFactory } from "@/handlers/logger-factory";
 import { LoggerService } from "@/handlers/logger";
 import { ParamId } from "@/middleware/param-converter.middleware";
 import { BadRequestException, NotFoundException } from "@/exceptions/runtime.exceptions";
-import type { FileFormatType } from "@/entities/print-job.entity";
+import type { FileFormatType, PrintJobMetadata } from "@/entities/print-job.entity";
 import { PrusaLinkType, type PrinterType } from "@/services/printer-api.interface";
 import { getIncompatibilityReason } from "@/utils/printer-compatibility.util";
 import { PrinterFirmwareCache } from "@/state/printer-firmware.cache";
@@ -629,6 +629,151 @@ export class PrintQueueController {
     } catch (error) {
       this.logger.error(`Failed to create job from file ${fileStorageId}: ${error}`);
       res.status(500).send({ error: "Failed to create job from file" });
+    }
+  }
+
+  /**
+   * Queue a file that already lives on the printer's USB / firmware storage.
+   * Counterpart to `from-file` for the case where the file was never uploaded
+   * to File Storage. We don't have analyzed metadata for these files so the
+   * job is created as NOT_ANALYZED with a minimal metadata stub; when its turn
+   * comes, the queue service calls `startPrint(path)` instead of re-uploading.
+   *
+   * Body:
+   *   - filePath:    printer-addressable path returned by GET /printer-files/:id
+   *   - displayName: optional friendly label (PrusaLink FAT 8.3 displayName)
+   *   - fileSize:    optional, surfaced from the printer's listing
+   *   - addToQueue:  default true
+   *   - position:    optional explicit queue position
+   */
+  @POST()
+  @route("/:printerId/from-usb-file")
+  @before([ParamId("printerId")])
+  async createJobFromUsbFile(req: Request, res: Response) {
+    const printerId = req.local.printerId;
+    const { filePath, displayName, fileSize, addToQueue = true, position } = req.body ?? {};
+
+    if (typeof filePath !== "string" || filePath.trim().length === 0) {
+      res.status(400).send({ error: "filePath is required" });
+      return;
+    }
+
+    try {
+      const printer = await this.printerCache.getCachedPrinterOrThrowAsync(printerId);
+
+      const inMaintenance = await this.printerMaintenanceLogService.hasActiveByPrinterId(printerId);
+      if (inMaintenance) {
+        res.status(400).send({
+          error: "Printer has pending maintenance",
+          message: `Printer ${printer.name} has pending maintenance and cannot accept print jobs. Complete the maintenance first.`,
+        });
+        return;
+      }
+
+      const fileName = displayName?.trim() || filePath.split("/").pop() || filePath;
+
+      const ext = (fileName.split(".").pop() ?? "").toLowerCase();
+      const fileFormat: FileFormatType | null =
+        ext === "gcode" ? "gcode" : ext === "bgcode" ? "bgcode" : ext === "3mf" ? "3mf" : null;
+
+      if (!fileFormat) {
+        res.status(400).send({
+          error: "Unsupported file format",
+          message: `Cannot determine print format from "${fileName}". Supported extensions: .gcode, .bgcode, .3mf.`,
+        });
+        return;
+      }
+
+      const incompatibilityReason = getIncompatibilityReason(printer.printerType as PrinterType, fileFormat);
+      if (incompatibilityReason) {
+        res.status(400).send({
+          error: "Incompatible printer for this file",
+          message: incompatibilityReason,
+          fileFormat,
+          printerType: printer.printerType,
+        });
+        return;
+      }
+
+      if (printer.printerType === PrusaLinkType && fileFormat === "bgcode") {
+        const info = await this.printerFirmwareCache.getOrFetch(printerId);
+        if (info.supportsBgcode === false) {
+          const modelLabel = info.model ?? "this PrusaLink model";
+          res.status(400).send({
+            error: "Incompatible printer for this file",
+            message: `Binary G-code (.bgcode) cannot be printed on ${modelLabel}. Re-slice as plain .gcode or pick a Buddy-firmware printer (MK4, MK3.9, MK3.5, XL, MINI+, Core One).`,
+            fileFormat,
+            printerType: printer.printerType,
+            printerModel: info.model ?? null,
+          });
+          return;
+        }
+      }
+
+      // Minimal metadata stub — the file lives on the printer so we can't
+      // analyze it without first downloading it. createPendingJob() will mark
+      // the job as NOT_ANALYZED because all the analysis fields are null.
+      const metadata: PrintJobMetadata = {
+        fileName,
+        fileFormat,
+        fileSize: typeof fileSize === "number" ? fileSize : undefined,
+        gcodePrintTimeSeconds: null,
+        nozzleDiameterMm: null,
+        filamentDiameterMm: null,
+        filamentDensityGramsCm3: null,
+        filamentUsedMm: null,
+        filamentUsedCm3: null,
+        filamentUsedGrams: null,
+        totalFilamentUsedGrams: null,
+        layerHeight: null,
+        firstLayerHeight: null,
+        bedTemperature: null,
+        nozzleTemperature: null,
+        fillDensity: null,
+        filamentType: null,
+        printerModel: null,
+        slicerVersion: null,
+        maxLayerZ: null,
+        totalLayers: null,
+      } as PrintJobMetadata;
+
+      const job = await this.printJobService.createPendingJob(printerId, fileName, metadata, printer.name);
+
+      job.usbFilePath = filePath;
+      job.usbDisplayName = displayName?.trim() || null;
+      job.fileFormat = fileFormat;
+      if (typeof fileSize === "number") {
+        job.fileSize = fileSize;
+      }
+      await this.printJobService.updateJob(job);
+
+      if (addToQueue) {
+        await this.printQueueService.addToQueue(printerId, job.id, position);
+      }
+
+      this.logger.log(
+        `Created job ${job.id} from USB file ${filePath} for printer ${printerId}${addToQueue ? " and added to queue" : ""}`,
+      );
+
+      res.send({
+        id: job.id,
+        printerId: job.printerId,
+        printerName: job.printerName,
+        fileName: job.fileName,
+        usbFilePath: job.usbFilePath,
+        usbDisplayName: job.usbDisplayName,
+        fileFormat: job.fileFormat,
+        status: job.status,
+        analysisState: job.analysisState,
+        createdAt: job.createdAt,
+        addedToQueue: addToQueue,
+      });
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof NotFoundException) {
+        throw error;
+      }
+      this.logger.error(`Failed to create job from USB file ${filePath}: ${error}`);
+      res.status(500).send({ error: "Failed to create job from USB file" });
     }
   }
 

@@ -386,6 +386,7 @@ __metadata:
     typeorm: "npm:0.3.29"
     typescript: "npm:6.0.3"
     uuid: "npm:11.1.1"
+    vite: "npm:^8.0.13"
     vite-plus: "npm:latest"
     vitest: "npm:@voidzero-dev/vite-plus-test@latest"
     winston: "npm:3.19.0"
@@ -1305,10 +1306,24 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@oxc-project/runtime@npm:=0.129.0":
+  version: 0.129.0
+  resolution: "@oxc-project/runtime@npm:0.129.0"
+  checksum: 10c0/e262104ff08092d0b7351095b414c543035aed54ac38a69f35687c5c401a923063442c54892af7ec5fc50aff5aebd2988f1731a84d3620a79a26a04f4e1f4a54
+  languageName: node
+  linkType: hard
+
 "@oxc-project/types@npm:=0.127.0":
   version: 0.127.0
   resolution: "@oxc-project/types@npm:0.127.0"
   checksum: 10c0/52c0947ac64a9ca119fe971f947e784a35ecd14a072fa3f542a58a5f6c42010b53f2bf92731e39b9899b83c990a9517bbd29d1e5a5b7b489e52616685c6a9278
+  languageName: node
+  linkType: hard
+
+"@oxc-project/types@npm:=0.129.0":
+  version: 0.129.0
+  resolution: "@oxc-project/types@npm:0.129.0"
+  checksum: 10c0/3714ba117af387992c2e5e779eedc1ccaf5a92c4d5c9b014dcc65d5a53012f8daae7aeb28930fef9eae7516bcdc500a0e689480eb1cb44a2e02830201fce7f1a
   languageName: node
   linkType: hard
 
@@ -7133,6 +7148,81 @@ __metadata:
     oxlint: bin/oxlint
     vp: bin/vp
   checksum: 10c0/193070c1812f8c4910ed7d0e70bfc94e7a101b21938f3d37b7badab8923c88fd4a6da4d2166b9b09fd66d986871c648a34757b21f947bc63174800a7c0229b2c
+  languageName: node
+  linkType: hard
+
+"vite@npm:@voidzero-dev/vite-plus-core@latest":
+  version: 0.1.22
+  resolution: "@voidzero-dev/vite-plus-core@npm:0.1.22"
+  dependencies:
+    "@oxc-project/runtime": "npm:=0.129.0"
+    "@oxc-project/types": "npm:=0.129.0"
+    fsevents: "npm:~2.3.3"
+    lightningcss: "npm:^1.30.2"
+    postcss: "npm:^8.5.6"
+  peerDependencies:
+    "@arethetypeswrong/core": ^0.18.1
+    "@tsdown/css": 0.22.0
+    "@tsdown/exe": 0.22.0
+    "@types/node": ^20.19.0 || >=22.12.0
+    "@vitejs/devtools": ^0.1.18
+    esbuild: ^0.27.0 || ^0.28.0
+    jiti: ">=1.21.0"
+    less: ^4.0.0
+    publint: ^0.3.8
+    sass: ^1.70.0
+    sass-embedded: ^1.70.0
+    stylus: ">=0.54.8"
+    sugarss: ^5.0.0
+    terser: ^5.16.0
+    tsx: ^4.8.1
+    typescript: ^5.0.0 || ^6.0.0
+    unplugin-unused: ^0.5.0
+    unrun: "*"
+    yaml: ^2.4.2
+  dependenciesMeta:
+    fsevents:
+      optional: true
+  peerDependenciesMeta:
+    "@arethetypeswrong/core":
+      optional: true
+    "@tsdown/css":
+      optional: true
+    "@tsdown/exe":
+      optional: true
+    "@types/node":
+      optional: true
+    "@vitejs/devtools":
+      optional: true
+    esbuild:
+      optional: true
+    jiti:
+      optional: true
+    less:
+      optional: true
+    publint:
+      optional: true
+    sass:
+      optional: true
+    sass-embedded:
+      optional: true
+    stylus:
+      optional: true
+    sugarss:
+      optional: true
+    terser:
+      optional: true
+    tsx:
+      optional: true
+    typescript:
+      optional: true
+    unplugin-unused:
+      optional: true
+    unrun:
+      optional: true
+    yaml:
+      optional: true
+  checksum: 10c0/2d843e5c85e0d880fbaa48123f4a24d2ce92372953d90ce0e72535577ca0ca70c35265a5edc244da000306a9c3d04ccc5964e7ae8a35ccc28e69e2ee3dbd2cd7
   languageName: node
   linkType: hard
 
