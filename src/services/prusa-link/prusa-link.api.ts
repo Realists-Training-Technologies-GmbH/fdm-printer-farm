@@ -12,6 +12,7 @@ import {
   uploadFileInputSchema,
 } from "@/services/printer-api.interface";
 import { AxiosError, AxiosPromise } from "axios";
+import FormData from "form-data";
 import type { LoginDto } from "../interfaces/login.dto";
 import type { ServerConfigDto } from "../moonraker/dto/server/server-config.dto";
 import type { SettingsDto } from "../octoprint/dto/settings/settings.dto";
@@ -524,14 +525,13 @@ export class PrusaLinkApi implements IPrinterApi {
   async uploadFile(input: UploadFileInput): Promise<void> {
     const validated = uploadFileInputSchema.parse(input);
 
-    // Prime the digest-auth nonce with a no-body request so the upload PUT below
-    // doesn't trigger a 401 retry that would silently send an empty stream body.
-    // We use the full /api/version payload so we can also gate `.bgcode`
-    // uploads on the actual printer model (Buddy 32-bit vs Marlin 8-bit).
+    // Fetch the full /api/version payload up-front: it tells us the printer
+    // model (Buddy 32-bit vs Marlin 8-bit Einsy), which gates both `.bgcode`
+    // support and the upload transport chosen further down.
     const versionInfo = await this.getVersionInfo();
+    const modelInfo = parsePrusaLinkModel(versionInfo);
 
     if (validated.fileName.toLowerCase().endsWith(".bgcode")) {
-      const modelInfo = parsePrusaLinkModel(versionInfo);
       if (modelInfo.supportsBgcode === false) {
         const label = modelInfo.model ?? "this PrusaLink printer";
         throw new ExternalServiceError(
@@ -577,37 +577,92 @@ export class PrusaLinkApi implements IPrinterApi {
       ? `/api/v1/files/${storage}/${subfolderEncoded}/${encodeURIComponent(validated.fileName)}`
       : `/api/v1/files/${storage}/${encodeURIComponent(validated.fileName)}`;
 
+    // PrusaLink upload directives. Sent per-request (not baked into the client)
+    // so the priming GET below isn't poisoned with the file's Content-Length.
+    const uploadHeaders = {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": validated.contentLength.toString(),
+      Overwrite: "?1",
+      "Print-After-Upload": validated.startPrint ? "?1" : "?0",
+    };
+
     const buildUploadClient = () =>
       this.createClient((b) => {
-        b.withHeaders({
-          "Content-Type": "application/octet-stream",
-          "Content-Length": validated.contentLength.toString(),
-          Overwrite: "?1",
-          "Print-After-Upload": validated.startPrint ? "?1" : "?0",
-        })
-          .withTimeout(this.settingsStore.getTimeoutSettings().apiUploadTimeout)
-          .withOnUploadProgress((p) => {
-            if (validated.uploadToken) {
-              this.eventEmitter2.emit(`${uploadProgressEvent(validated.uploadToken)}`, validated.uploadToken, p);
-            }
-          });
+        b.withTimeout(this.settingsStore.getTimeoutSettings().apiUploadTimeout).withOnUploadProgress((p) => {
+          if (validated.uploadToken) {
+            this.eventEmitter2.emit(`${uploadProgressEvent(validated.uploadToken)}`, validated.uploadToken, p);
+          }
+        });
       });
+
+    // The streaming body can't be replayed, so it must not be the request that
+    // triggers the digest 401 → challenge dance (that retry would resend an
+    // empty body). MK3/MK2.5 bind the nonce to the TCP connection, so we prime
+    // the challenge with a no-body GET on the *same* single-socket client; the
+    // request interceptor then signs the upload up-front and it goes out
+    // already authenticated on the same connection.
+
+    // Modern Buddy firmware (MK4/XL/MINI/Core One): PUT the raw octet-stream.
+    const putWithPriming = async (stream: unknown) => {
+      const client = buildUploadClient();
+      await client.get("/api/version").catch(() => undefined);
+      return client.put(uploadPath, stream, { headers: uploadHeaders });
+    };
+
+    // Legacy standalone PrusaLink (MK3/MK2.5 Einsy shim, server 0.x) returns
+    // 500 on the modern PUT despite advertising `upload-by-put`. Its working
+    // path is the OctoPrint-compatible multipart POST /api/files/<location>.
+    const postLegacyMultipart = async (stream: unknown) => {
+      const form = new FormData();
+      if (validated.startPrint) {
+        form.append("print", "true");
+      }
+      if (subfolderResolved) {
+        form.append("path", subfolderResolved);
+      }
+      form.append("file", stream as never, {
+        filename: validated.fileName,
+        knownLength: validated.contentLength,
+      });
+      const length = await new Promise<number>((resolve, reject) =>
+        form.getLength((err, len) => (err ? reject(new Error("Could not compute multipart length")) : resolve(len))),
+      );
+      const client = buildUploadClient();
+      await client.get("/api/version").catch(() => undefined);
+      return client.post(`/api/files/${storage}`, form, {
+        headers: { ...form.getHeaders(), "Content-Length": length.toString() },
+      });
+    };
+
+    // Einsy boards (no .bgcode support) only accept the legacy multipart POST.
+    const useLegacyMultipart = modelInfo.supportsBgcode === false;
 
     try {
       let response;
-      try {
-        response = await buildUploadClient().put(uploadPath, validated.stream);
-      } catch (firstErr: any) {
-        // PrusaLink's digest interceptor refuses to replay a Readable body, so
-        // a first 401 leaves the connection un-authenticated. With a fresh
-        // stream we can retry exactly once — the auth header is now cached
-        // and the PUT goes through cleanly.
-        const status = (firstErr as AxiosError)?.response?.status;
-        if (status === 401 && typeof validated.streamFactory === "function") {
-          this.logger.debug("Upload hit a 401; retrying once with a fresh stream", this.logMeta());
-          response = await buildUploadClient().put(uploadPath, validated.streamFactory());
-        } else {
-          throw firstErr;
+      if (useLegacyMultipart) {
+        response = await postLegacyMultipart(validated.stream);
+      } else {
+        try {
+          response = await putWithPriming(validated.stream);
+        } catch (firstErr: any) {
+          // Priming should make the PUT authenticate on the first try. If it
+          // still fails, retry once from a fresh stream: a 401 means the nonce
+          // expired between the GET and the PUT; a 5xx means this firmware
+          // advertises upload-by-put but can't honour it, so fall back to the
+          // legacy multipart POST.
+          const status = (firstErr as AxiosError)?.response?.status;
+          if (typeof validated.streamFactory !== "function") {
+            throw firstErr;
+          }
+          if (status === 401) {
+            this.logger.debug("Upload hit a 401 after priming; retrying once with a fresh stream", this.logMeta());
+            response = await putWithPriming(validated.streamFactory());
+          } else if (status && status >= 500) {
+            this.logger.warn(`Upload PUT returned ${status}; falling back to legacy multipart POST`, this.logMeta());
+            response = await postLegacyMultipart(validated.streamFactory());
+          } else {
+            throw firstErr;
+          }
         }
       }
 

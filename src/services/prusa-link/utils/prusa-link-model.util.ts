@@ -41,10 +41,12 @@ const LEGACY_NO_BGCODE = ["MK3S+", "MK3S", "MK3", "MK2.5S", "MK2.5"];
  * open or closed.
  */
 export function parsePrusaLinkModel(
-  version: Pick<VersionDto, "text" | "hostname"> | null | undefined,
+  version: Pick<VersionDto, "text" | "hostname" | "original"> | null | undefined,
 ): PrusaLinkModelInfo {
   const raw = version?.text ?? null;
-  const haystack = `${version?.text ?? ""} ${version?.hostname ?? ""}`.toUpperCase();
+  // Legacy MK3/MK2.5 put the model in `original` ("PrusaLink I3MK3S") and only
+  // a version string in `text`, so search all three fields.
+  const haystack = `${version?.text ?? ""} ${version?.original ?? ""} ${version?.hostname ?? ""}`.toUpperCase();
 
   if (!haystack.trim()) {
     return { model: null, supportsBgcode: null, raw };
