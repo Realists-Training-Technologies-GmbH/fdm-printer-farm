@@ -17,7 +17,7 @@ import type { ServerConfigDto } from "../moonraker/dto/server/server-config.dto"
 import type { SettingsDto } from "../octoprint/dto/settings/settings.dto";
 import { PrusaLinkHttpClientBuilder } from "@/services/prusa-link/utils/prusa-link-http-client.builder";
 import type { VersionDto } from "@/services/prusa-link/dto/version.dto";
-import type { PL_StatusDto } from "@/services/prusa-link/dto/status.dto";
+import type { PL_StatusDto, PL_StorageDto } from "@/services/prusa-link/dto/status.dto";
 import type { PL_PrinterStateDto } from "@/services/prusa-link/dto/printer-state.dto";
 import type { PL_JobStateDto } from "@/services/prusa-link/dto/job-state.dto";
 import { uploadDoneEvent, uploadFailedEvent, uploadProgressEvent } from "@/constants/event.constants";
@@ -38,6 +38,9 @@ const defaultLog = { adapter: "prusa-link" };
 export class PrusaLinkApi implements IPrinterApi {
   protected logger: LoggerService;
   private authHeader: string | null = null;
+  // Memoized "internal printing storage" segment (see getInternalStorage).
+  // A printer's storage layout is fixed, so resolve it once per instance.
+  private internalStorageSegment: string | null = null;
 
   constructor(
     loggerFactory: ILoggerFactory,
@@ -88,7 +91,7 @@ export class PrusaLinkApi implements IPrinterApi {
     await this.getVersion();
   }
 
-  async getFiles(recursive = false, startDir = "/usb") {
+  async getFiles(recursive = false, startDir = "") {
     if (recursive) {
       throw new ExternalServiceError(
         {
@@ -110,8 +113,11 @@ export class PrusaLinkApi implements IPrinterApi {
     // not the FAT 8.3 short names PrusaLink stores them under, so we resolve
     // each segment back to its short name before talking to the firmware.
     const trimmed = (startDir ?? "").replace(/^\/+|\/+$/g, "");
-    const storageMatch = trimmed.match(/^(usb|local)(?:\/(.+))?$/i);
-    const storage = (storageMatch?.[1] ?? "usb").toLowerCase();
+    const storageMatch = trimmed.match(/^(usb|local|sdcard)(?:\/(.+))?$/i);
+    // When startDir names a storage explicitly use it. Otherwise list the
+    // internal printing storage (usb on Buddy, local on Einsy) instead of
+    // assuming "usb", which 404s on MK3/MK2.5.
+    const storage = storageMatch ? storageMatch[1].toLowerCase() : await this.getInternalStorage();
     const relPath = storageMatch ? (storageMatch[2] ?? "") : trimmed;
 
     // Try the path as-is (LFN) first — see `resolveEncodedPath` for the rationale.
@@ -191,7 +197,7 @@ export class PrusaLinkApi implements IPrinterApi {
     });
 
     // PrusaLink's folder listings don't include `size` for child files (only
-    // the individual `/api/v1/files/usb/<path>` endpoint does). Fetch sizes
+    // the individual `/api/v1/files/<storage>/<path>` endpoint does). Fetch sizes
     // in parallel for the files that are missing one. Cap to a reasonable
     // batch so a huge folder doesn't fan out into thousands of requests.
     const sizeFetchCap = 64;
@@ -231,7 +237,7 @@ export class PrusaLinkApi implements IPrinterApi {
    * that already encode for the printer API). Each segment is decoded before
    * matching.
    */
-  private async resolveStoragePath(userPath: string, storage = "usb"): Promise<string> {
+  private async resolveStoragePath(userPath: string, storage: string): Promise<string> {
     if (!userPath) return "";
     const segments = userPath
       .split("/")
@@ -283,7 +289,7 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   /** Resolve an already-encoded user path to an encoded FAT short-name path. */
-  private async resolveEncodedPath(encodedPath: string, storage = "usb"): Promise<string> {
+  private async resolveEncodedPath(encodedPath: string, storage: string): Promise<string> {
     if (!encodedPath) return encodedPath;
 
     // Optimistically try the path as-is — Buddy firmware's FatFS LFN support
@@ -303,8 +309,9 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async getFile(path: string): Promise<FileDto> {
-    const resolved = await this.resolveEncodedPath(path);
-    const response = await this.getFileRaw(resolved);
+    const storage = await this.getInternalStorage();
+    const resolved = await this.resolveEncodedPath(path, storage);
+    const response = await this.getFileRaw(resolved, storage);
 
     const isDir = (response.data.type ?? "").toUpperCase() === "FOLDER";
     return {
@@ -388,8 +395,9 @@ export class PrusaLinkApi implements IPrinterApi {
       if (e instanceof ExternalServiceError) throw e;
     }
 
-    const resolved = await this.resolveEncodedPath(path);
-    await this.client.post<void>(`/api/v1/files/usb/${resolved}`);
+    const storage = await this.getInternalStorage();
+    const resolved = await this.resolveEncodedPath(path, storage);
+    await this.client.post<void>(`/api/v1/files/${storage}/${resolved}`);
   }
 
   async pausePrint(): Promise<void> {
@@ -470,14 +478,15 @@ export class PrusaLinkApi implements IPrinterApi {
     // Try the LFN path directly. Only walk segment-by-segment if the firmware
     // rejects with 404 (which it shouldn't, since Buddy resolves LFN, but the
     // fallback is here as insurance for older firmware).
+    const storage = await this.getInternalStorage();
     let fileReference;
     try {
-      fileReference = await this.getFileRaw(path);
+      fileReference = await this.getFileRaw(path, storage);
     } catch (e: any) {
       if (e?.response?.status !== 404) throw e;
-      const shortPath = await this.resolveStoragePath(path);
+      const shortPath = await this.resolveStoragePath(path, storage);
       const encoded = shortPath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-      fileReference = await this.getFileRaw(encoded);
+      fileReference = await this.getFileRaw(encoded, storage);
     }
     const pathUrl = fileReference.data.refs.download;
     const displayName = fileReference.data.display_name;
@@ -500,8 +509,9 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async getFileChunk(path: string, startBytes: number, endBytes: number): AxiosPromise<string> {
-    const resolved = await this.resolveEncodedPath(path);
-    const fileReference = await this.getFileRaw(resolved);
+    const storage = await this.getInternalStorage();
+    const resolved = await this.resolveEncodedPath(path, storage);
+    const fileReference = await this.getFileRaw(resolved, storage);
     const pathUrl = fileReference.data.refs.download;
 
     return await this.createClient((o) =>
@@ -536,16 +546,16 @@ export class PrusaLinkApi implements IPrinterApi {
       }
     }
 
-    // Refuse the upload up-front if the USB is too small to hold the file.
-    // We treat status as best-effort — if the probe fails, let the actual PUT
-    // surface the error.
+    // Refuse the upload up-front if the internal storage is too small to hold
+    // the file. We treat status as best-effort — if the probe fails, let the
+    // actual PUT surface the error.
     try {
       const status = await this.getStatus();
-      const freeSpace = status.storage?.free_space;
+      const freeSpace = this.getStorageList(status).find((s) => !s.read_only)?.free_space;
       if (typeof freeSpace === "number" && freeSpace > 0 && freeSpace < validated.contentLength) {
         throw new ExternalServiceError(
           {
-            error: `Not enough free space on the USB drive: needs ${validated.contentLength} bytes but only ${freeSpace} are available.`,
+            error: `Not enough free space on the printer storage: needs ${validated.contentLength} bytes but only ${freeSpace} are available.`,
             statusCode: 507,
             data: { freeSpace, requiredBytes: validated.contentLength },
             success: false,
@@ -559,12 +569,13 @@ export class PrusaLinkApi implements IPrinterApi {
 
     // Resolve the destination subfolder (if any) against display_name first
     // so the PUT lands in the same folder the user is browsing.
+    const storage = await this.getInternalStorage();
     const targetSubfolder = (validated.targetPath ?? "").replace(/^\/+|\/+$/g, "");
-    const subfolderResolved = targetSubfolder ? await this.resolveStoragePath(targetSubfolder) : "";
+    const subfolderResolved = targetSubfolder ? await this.resolveStoragePath(targetSubfolder, storage) : "";
     const subfolderEncoded = subfolderResolved.split("/").filter(Boolean).map(encodeURIComponent).join("/");
     const uploadPath = subfolderEncoded
-      ? `/api/v1/files/usb/${subfolderEncoded}/${encodeURIComponent(validated.fileName)}`
-      : `/api/v1/files/usb/${encodeURIComponent(validated.fileName)}`;
+      ? `/api/v1/files/${storage}/${subfolderEncoded}/${encodeURIComponent(validated.fileName)}`
+      : `/api/v1/files/${storage}/${encodeURIComponent(validated.fileName)}`;
 
     const buildUploadClient = () =>
       this.createClient((b) => {
@@ -639,7 +650,7 @@ export class PrusaLinkApi implements IPrinterApi {
       } else if (status === 415) {
         friendly = "PrusaLink rejected the upload: file format not supported by this firmware.";
       } else if (status === 507) {
-        friendly = "PrusaLink rejected the upload: not enough free space on USB.";
+        friendly = "PrusaLink rejected the upload: not enough free space on the printer storage.";
       }
 
       throw new ExternalServiceError(
@@ -656,20 +667,22 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   async deleteFile(path: string): Promise<void> {
-    const resolved = await this.resolveEncodedPath(path);
-    await this.client.delete<void>(`/api/v1/files/usb/${resolved}`);
+    const storage = await this.getInternalStorage();
+    const resolved = await this.resolveEncodedPath(path, storage);
+    await this.client.delete<void>(`/api/v1/files/${storage}/${resolved}`);
   }
 
   async deleteFolder(path: string): Promise<void> {
-    const resolved = await this.resolveEncodedPath(path);
-    await this.client.delete<void>(`/api/v1/files/usb/${resolved}`);
+    const storage = await this.getInternalStorage();
+    const resolved = await this.resolveEncodedPath(path, storage);
+    await this.client.delete<void>(`/api/v1/files/${storage}/${resolved}`);
   }
 
   /**
-   * Create a folder on the USB storage. PrusaLink uses POST against the
-   * target path with the `Create-Folder: ?1` directive. The parent segments
-   * are resolved through display_name first so the request lands in the same
-   * place the user is browsing.
+   * Create a folder on the internal printing storage. PrusaLink uses POST
+   * against the target path with the `Create-Folder: ?1` directive. The parent
+   * segments are resolved through display_name first so the request lands in
+   * the same place the user is browsing.
    */
   async createFolder(path: string): Promise<void> {
     const trimmed = (path ?? "").replace(/^\/+|\/+$/g, "");
@@ -680,9 +693,10 @@ export class PrusaLinkApi implements IPrinterApi {
       );
     }
 
+    const storage = await this.getInternalStorage();
     const segments = trimmed.split("/").filter(Boolean);
     const newName = segments.pop()!;
-    const parentResolved = await this.resolveStoragePath(segments.join("/"));
+    const parentResolved = await this.resolveStoragePath(segments.join("/"), storage);
     const parentEncoded = parentResolved.split("/").filter(Boolean).map(encodeURIComponent).join("/");
     const targetEncoded = parentEncoded
       ? `${parentEncoded}/${encodeURIComponent(newName)}`
@@ -690,7 +704,7 @@ export class PrusaLinkApi implements IPrinterApi {
 
     await this.createClient((b) => {
       b.withHeaders({ "Create-Folder": "?1" });
-    }).post<void>(`/api/v1/files/usb/${targetEncoded}`);
+    }).post<void>(`/api/v1/files/${storage}/${targetEncoded}`);
   }
 
   getSettings(): Promise<ServerConfigDto | SettingsDto> {
@@ -722,14 +736,15 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   /**
-   * Stream the firmware-stored thumbnail for a file. We hit `/api/v1/files/usb/<path>`
+   * Stream the firmware-stored thumbnail for a file. We hit `/api/v1/files/<storage>/<path>`
    * first to read the `refs.thumbnailSmall|thumbnailBig` URL the printer
    * advertises, then stream that URL back. Falling back to the small variant
    * when the big one isn't published keeps the call useful on every firmware.
    */
   async getFileThumbnail(path: string, variant: "small" | "big" = "big"): AxiosPromise<NodeJS.ReadableStream> {
-    const resolved = await this.resolveEncodedPath(path);
-    const file = await this.getFileRaw(resolved);
+    const storage = await this.getInternalStorage();
+    const resolved = await this.resolveEncodedPath(path, storage);
+    const file = await this.getFileRaw(resolved, storage);
     const refs = file.data?.refs as { thumbnailSmall?: string; thumbnailBig?: string } | undefined;
     const url =
       (variant === "big" ? refs?.thumbnailBig : refs?.thumbnailSmall) ?? refs?.thumbnailSmall ?? refs?.thumbnailBig;
@@ -775,13 +790,48 @@ export class PrusaLinkApi implements IPrinterApi {
     }
   }
 
-  private getFileRaw(path: string, storage = "usb") {
+  private getFileRaw(path: string, storage: string) {
     return this.client.get<PL_FileDto>(`/api/v1/files/${storage}/${path}`);
   }
 
   private async getCurrentJobId() {
     const status = await this.getStatus();
     return status.job?.id;
+  }
+
+  /**
+   * The printer's "internal printing storage" — the writable storage where
+   * gcodes are uploaded to and printed from. This is the generic notion the
+   * rest of the stack calls "usb": on Buddy firmware (MK4/XL/MINI/Core One)
+   * it really is `usb`, but on the Einsy shim (MK3/MK2.5) the equivalent is
+   * `local` (the box exposes /local + a read-only /sdcard and no /usb).
+   *
+   * Resolved from `/api/v1/status` (first writable storage, else the first
+   * reported one) and memoized, since a printer's storage layout is fixed.
+   * Falls back to `usb` when status can't be read.
+   */
+  private async getInternalStorage(): Promise<string> {
+    if (this.internalStorageSegment) {
+      return this.internalStorageSegment;
+    }
+    try {
+      const list = this.getStorageList(await this.getStatus());
+      const chosen = (list.find((s) => s?.path && !s.read_only) ?? list[0])?.path;
+      if (chosen) {
+        this.internalStorageSegment = chosen.replace(/^\/+|\/+$/g, "").toLowerCase();
+        return this.internalStorageSegment;
+      }
+    } catch {
+      // Status probe failed — fall back to the legacy default below.
+    }
+    return "usb";
+  }
+
+  /** Normalize `status.storage` (single object on Buddy, array on Einsy) to an array. */
+  private getStorageList(status: PL_StatusDto): PL_StorageDto[] {
+    const s = status.storage;
+    if (Array.isArray(s)) return s;
+    return s ? [s] : [];
   }
 
   /**
@@ -813,9 +863,7 @@ export class PrusaLinkApi implements IPrinterApi {
           this.printerLogin.username,
           this.printerLogin.password,
           (error) => {
-            this.logger.error(
-              `Authentication error occurred for ${this.printerLogin?.printerURL}: ${error?.message}`,
-            );
+            this.logger.error(`Authentication error occurred for ${this.printerLogin?.printerURL}: ${error?.message}`);
           },
           (error, attemptCount) => {
             this.logger.log(

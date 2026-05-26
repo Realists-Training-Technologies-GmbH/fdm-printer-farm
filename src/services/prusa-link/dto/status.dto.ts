@@ -1,6 +1,8 @@
 export interface PL_StatusDto {
   printer: PL_PrinterDto;
-  storage: PL_StorageDto;
+  // Buddy firmware (MK4/XL/MINI) reports a single storage object; the Einsy
+  // shim (MK3/MK2.5) reports an array of storages (e.g. /local + /sdcard).
+  storage: PL_StorageDto | PL_StorageDto[];
   job?: PL_JobDto;
   transfer?: PL_TransferDto;
   camera?: PL_CameraDto;
@@ -52,7 +54,8 @@ export interface PL_StorageDto {
   name: string;
   path: string;
   read_only: boolean;
-  free_space: number;
+  // Read-only storages (e.g. the MK3S SD card) omit free_space.
+  free_space?: number;
 }
 
 export interface PL_CameraDto {

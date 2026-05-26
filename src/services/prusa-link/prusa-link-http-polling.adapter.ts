@@ -214,7 +214,11 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
             timeTransferring: status.transfer.time_transferring,
           }
         : null;
-      const freeSpace = status?.storage?.free_space ?? null;
+      // `storage` is a single object on Buddy firmware but an array on the
+      // Einsy shim (MK3/MK2.5). Report the writable storage's free space
+      // (where uploads/prints land), falling back to the first reported one.
+      const storageList = Array.isArray(status?.storage) ? status.storage : status?.storage ? [status.storage] : [];
+      const freeSpace = (storageList.find((s) => !s.read_only) ?? storageList[0])?.free_space ?? null;
       // Carry the firmware's own status text alongside the link_state mapping
       // so the frontend can show a tooltip with the printer's exact reason
       // for the current state (especially during ATTENTION).
