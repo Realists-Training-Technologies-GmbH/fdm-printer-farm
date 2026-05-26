@@ -734,10 +734,11 @@ export class PrusaLinkApi implements IPrinterApi {
   }
 
   /**
-   * Create a folder on the internal printing storage. PrusaLink uses POST
-   * against the target path with the `Create-Folder: ?1` directive. The parent
-   * segments are resolved through display_name first so the request lands in
-   * the same place the user is browsing.
+   * Create a folder on the internal printing storage. PrusaLink uses a PUT
+   * against the target path with the `Create-Folder: ?1` directive (POST 404s
+   * — the modern files API only routes folder creation through PUT). The
+   * parent segments are resolved through display_name first so the request
+   * lands in the same place the user is browsing.
    */
   async createFolder(path: string): Promise<void> {
     const trimmed = (path ?? "").replace(/^\/+|\/+$/g, "");
@@ -759,7 +760,7 @@ export class PrusaLinkApi implements IPrinterApi {
 
     await this.createClient((b) => {
       b.withHeaders({ "Create-Folder": "?1" });
-    }).post<void>(`/api/v1/files/${storage}/${targetEncoded}`);
+    }).put<void>(`/api/v1/files/${storage}/${targetEncoded}`);
   }
 
   getSettings(): Promise<ServerConfigDto | SettingsDto> {
