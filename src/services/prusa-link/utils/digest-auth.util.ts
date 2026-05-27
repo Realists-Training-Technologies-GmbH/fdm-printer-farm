@@ -19,19 +19,12 @@ export function generateDigestAuthHeader(params: DigestAuthParams): string {
   }
   const ha2 = md5(`${method}:${uri}`);
 
-  const response = qop
-    ? md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`)
-    : md5(`${ha1}:${nonce}:${ha2}`);
+  const response = qop ? md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`) : md5(`${ha1}:${nonce}:${ha2}`);
 
   // Build the header. `algorithm` and `opaque` are echoed back when the
   // server sent them — some implementations (PrusaLink included) validate
   // that the opaque round-trips unchanged.
-  const parts = [
-    `username="${username}"`,
-    `realm="${realm}"`,
-    `nonce="${nonce}"`,
-    `uri="${uri}"`,
-  ];
+  const parts = [`username="${username}"`, `realm="${realm}"`, `nonce="${nonce}"`, `uri="${uri}"`];
   if (qop) {
     parts.push(`qop=${qop}`, `nc=${nc}`, `cnonce="${cnonce}"`);
   }
