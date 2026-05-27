@@ -26,7 +26,7 @@ import { ExternalServiceError } from "@/exceptions/runtime.exceptions";
 import EventEmitter2 from "eventemitter2";
 import type { PL_FileDto } from "@/services/prusa-link/dto/file.dto";
 import { SettingsStore } from "@/state/settings.store";
-import { parsePrusaLinkModel } from "@/services/prusa-link/utils/prusa-link-model.util";
+import { deriveCapabilities } from "@/services/prusa-link/utils/prusa-link-capabilities";
 import { apiKeyHeaderKey } from "@/services/octoprint/constants/octoprint-service.constants";
 
 const defaultLog = { adapter: "prusa-link" };
@@ -551,16 +551,16 @@ export class PrusaLinkApi implements IPrinterApi {
     // model (Buddy 32-bit vs Marlin 8-bit Einsy), which gates both `.bgcode`
     // support and the upload transport chosen further down.
     const versionInfo = await this.getVersionInfo();
-    const modelInfo = parsePrusaLinkModel(versionInfo);
+    const caps = deriveCapabilities(versionInfo);
 
     if (validated.fileName.toLowerCase().endsWith(".bgcode")) {
-      if (modelInfo.supportsBgcode === false) {
-        const label = modelInfo.model ?? "this PrusaLink printer";
+      if (caps.supportsBgcode === false) {
+        const label = caps.model ?? "this PrusaLink printer";
         throw new ExternalServiceError(
           {
             error: `Binary G-code (.bgcode) cannot be printed on ${label}. Re-slice as plain .gcode or use a Buddy-firmware printer (MK4, MK3.9, MK3.5, XL, MINI+, Core One).`,
             statusCode: 400,
-            data: { model: modelInfo.model, versionText: versionInfo.text },
+            data: { model: caps.model, versionText: versionInfo.text },
             success: false,
           },
           "Prusa-Link",
@@ -657,7 +657,7 @@ export class PrusaLinkApi implements IPrinterApi {
     };
 
     // Einsy boards (no .bgcode support) only accept the legacy multipart POST.
-    const useLegacyMultipart = modelInfo.supportsBgcode === false;
+    const useLegacyMultipart = caps.uploadTransport === "legacyMultipart";
 
     try {
       let response;
