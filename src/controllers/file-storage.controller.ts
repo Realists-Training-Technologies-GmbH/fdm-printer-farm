@@ -9,9 +9,10 @@ import { MulterService } from "@/services/core/multer.service";
 import type { ILoggerFactory } from "@/handlers/logger-factory";
 import { LoggerService } from "@/handlers/logger";
 import { FileAnalysisService } from "@/services/file-analysis.service";
-import { BadRequestException } from "@/exceptions/runtime.exceptions";
+import { BadRequestException, ConflictException } from "@/exceptions/runtime.exceptions";
 import { copyFileSync, existsSync, unlinkSync } from "node:fs";
 import { extname } from "node:path";
+import AdmZip from "adm-zip";
 
 @route(AppConstants.apiRoute + "/file-storage")
 @before([authenticate(), authorizeRoles([ROLES.ADMIN, ROLES.OPERATOR])])
@@ -96,6 +97,42 @@ export class FileStorageController {
     res.send({ folders });
   }
 
+  @GET()
+  @route("/folders/export")
+  async exportFolder(req: Request, res: Response) {
+    const folderPath = FileStorageFolderService.normalisePath((req.query.path as string) ?? null);
+    if (!folderPath) {
+      throw new BadRequestException("`path` query param is required and cannot be root");
+    }
+
+    // Everything in the subtree (the folder itself or any descendant).
+    const all = await this.fileStorageService.listAllFiles();
+    const inside = all.filter((f) => {
+      const fp: string | null = f.metadata?._folderPath ?? null;
+      if (!fp) return false;
+      return fp === folderPath || fp.startsWith(folderPath + "/");
+    });
+
+    // Rebuild the folder hierarchy inside the archive using each file's original
+    // name, placed under its path relative to the exported folder.
+    const zip = new AdmZip();
+    for (const f of inside) {
+      const buffer = await this.fileStorageService.getFile(f.fileStorageId);
+      const fp = f.metadata?._folderPath ?? folderPath;
+      const relDir = fp === folderPath ? "" : fp.substring(folderPath.length + 1);
+      const name = f.metadata?._originalFileName || f.fileName;
+      const entryPath = relDir ? `${relDir}/${name}` : name;
+      zip.addFile(entryPath, buffer);
+    }
+
+    const folderName = FileStorageFolderService.nameOf(folderPath) || "folder";
+    const archive = zip.toBuffer();
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${folderName}.zip"`);
+    res.setHeader("Content-Length", archive.length.toString());
+    res.send(archive);
+  }
+
   @POST()
   @route("/folders")
   async createFolder(req: Request, res: Response) {
@@ -132,15 +169,16 @@ export class FileStorageController {
     const rawPath = (req.query.path as string) ?? "";
     const force = (req.query.force as string) === "true";
     const cascade = (req.query.cascade as string) === "true";
+    // Standard filesystem "rm -rf" semantics: also delete the file binaries
+    // inside the subtree (not just move them back to root like `cascade`).
+    const deleteFiles = (req.query.deleteFiles as string) === "true";
 
     const normalised = FileStorageFolderService.normalisePath(rawPath);
     if (!normalised) {
       throw new BadRequestException("`path` query param is required and cannot be root");
     }
 
-    // Refuse the delete if files still live inside the subtree, unless the
-    // caller opted into cascading: in that case we move files back to root
-    // before removing the folder rows (the file binaries are never lost).
+    // Files anywhere in the subtree (the folder itself or any descendant).
     const all = await this.fileStorageService.listAllFiles();
     const filesInside = all.filter((f) => {
       const fp: string | null = f.metadata?._folderPath ?? null;
@@ -148,21 +186,32 @@ export class FileStorageController {
       return fp === normalised || fp.startsWith(normalised + "/");
     });
 
+    let filesDeleted = 0;
+    let filesMovedToRoot = 0;
     if (filesInside.length > 0) {
-      if (!cascade) {
+      if (deleteFiles) {
+        // Permanently delete the contained files (binaries + metadata).
+        for (const f of filesInside) {
+          await this.fileStorageService.deleteFile(f.fileStorageId);
+        }
+        filesDeleted = filesInside.length;
+      } else if (cascade) {
+        // Preserve binaries: move them back to root before dropping the folders.
+        for (const f of filesInside) {
+          await this.fileStorageService.setFolderPath(f.fileStorageId, null);
+        }
+        filesMovedToRoot = filesInside.length;
+      } else {
         res.status(409).send({
-          error: `Folder ${normalised} still contains ${filesInside.length} file(s). Pass cascade=true to move them back to root, or move/delete them first.`,
+          error: `Folder ${normalised} still contains ${filesInside.length} file(s). Pass deleteFiles=true to delete them, or cascade=true to move them back to root.`,
           filesInside: filesInside.length,
         });
         return;
       }
-      for (const f of filesInside) {
-        await this.fileStorageService.setFolderPath(f.fileStorageId, null);
-      }
     }
 
     const result = await this.fileStorageFolderService.deleteFolder(rawPath, { force });
-    res.send({ deletedPaths: result.deletedPaths, filesMovedToRoot: filesInside.length });
+    res.send({ deletedPaths: result.deletedPaths, filesMovedToRoot, filesDeleted });
   }
 
   @PATCH()
@@ -185,6 +234,20 @@ export class FileStorageController {
       const folder = await this.fileStorageFolderService.findByPath(normalised);
       if (!folder) {
         throw new BadRequestException(`Folder ${normalised} doesn't exist — create it first`);
+      }
+    }
+
+    // Reject a move that would put two files of the same name in one folder —
+    // keeps per-folder uniqueness consistent with the upload path.
+    const meta = await this.fileStorageService.loadMetadata(fileStorageId);
+    const originalName: string | undefined = meta?._originalFileName;
+    if (originalName) {
+      const clash = await this.fileStorageService.findDuplicateByOriginalFileName(originalName, normalised);
+      if (clash && clash.fileStorageId !== fileStorageId) {
+        throw new ConflictException(
+          `A file named "${originalName}" already exists ${normalised ? `in folder "${normalised}"` : "in the root folder"}. Rename or remove it first.`,
+          clash.fileStorageId,
+        );
       }
     }
 
@@ -391,7 +454,7 @@ export class FileStorageController {
       const analysisResult = await this.fileAnalysisService.analyzeFile(tempPathWithExt);
       const { metadata, thumbnails } = analysisResult;
 
-      const fileStorageId = await this.fileStorageService.saveFile(file, fileHash);
+      const fileStorageId = await this.fileStorageService.saveFile(file, fileHash, folderPath);
       this.logger.log(`Saved ${file.originalname} as ${fileStorageId}`);
 
       const thumbnailMetadata =
