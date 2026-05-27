@@ -775,10 +775,20 @@ export class PrusaLinkApi implements IPrinterApi {
    * whatever fields each PrusaLink version exposes.
    */
   async listCameras(): Promise<unknown[]> {
-    const response = await this.client.get<{ camera_list?: unknown[] } | unknown[]>("/api/v1/cameras");
-    const data = response.data as { camera_list?: unknown[] };
-    if (Array.isArray(data)) return data;
-    return data?.camera_list ?? [];
+    try {
+      const response = await this.client.get<{ camera_list?: unknown[] } | unknown[]>("/api/v1/cameras");
+      const data = response.data as { camera_list?: unknown[] };
+      if (Array.isArray(data)) return data;
+      return data?.camera_list ?? [];
+    } catch (e) {
+      // Firmware without the cameras endpoint (e.g. some Buddy builds like the
+      // XL's 2.1.2, or the legacy Einsy shim) answers 404. Treat that as "no
+      // cameras" so the camera UI degrades gracefully instead of surfacing an
+      // error — mirrors how the MK3 returns an empty list. Re-throw everything
+      // else (auth, network, 5xx).
+      if ((e as AxiosError)?.response?.status === 404) return [];
+      throw e;
+    }
   }
 
   /**
