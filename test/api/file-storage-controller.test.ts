@@ -21,14 +21,26 @@ describe("FileStorageController", () => {
       .attach("file", Buffer.from(content), filename);
   };
 
+  const uploadFileTo = (filename: string, content: string, folderPath: string) => {
+    return testRequest
+      .post(`${baseRoute}/upload`)
+      .set("Accept", "application/json")
+      .field("folderPath", folderPath)
+      .attach("file", Buffer.from(content), filename);
+  };
+
   let mockFileIdCounter = 0;
   let uploadedFilenames: Map<string, string>;
+  // Folder-aware uniqueness map: key is `${folderPath ?? ""}|${filename}`.
+  let uploadedKeys: Map<string, string>;
+  const uniqKey = (filename: string, folderPath?: string | null) => `${folderPath ?? ""}|${filename}`;
 
   beforeAll(async () => {
     const { request, container } = await setupTestApp(false);
     testRequest = request;
     fileStorageService = container.resolve<FileStorageService>(DITokens.fileStorageService);
     uploadedFilenames = new Map();
+    uploadedKeys = new Map();
 
     vi.spyOn(fileStorageService, "saveFile").mockImplementation(async (file) => {
       const fileId = `mock-file-id-${++mockFileIdCounter}`;
@@ -38,32 +50,39 @@ describe("FileStorageController", () => {
 
     vi.spyOn(fileStorageService, "calculateFileHash").mockResolvedValue("mock-hash-abc123");
     vi.spyOn(fileStorageService, "getFilePath").mockImplementation((id: string) => `/mock/path/${id}`);
-    vi.spyOn(fileStorageService, "saveMetadata").mockResolvedValue(undefined);
+    // Record the (folder, filename) key so the uniqueness mock can scope by folder.
+    vi.spyOn(fileStorageService, "saveMetadata").mockImplementation(
+      async (fileStorageId, _metadata, _fileHash, originalFileName, _thumbs, folderPath) => {
+        if (originalFileName) uploadedKeys.set(uniqKey(originalFileName, folderPath), fileStorageId);
+      },
+    );
     vi.spyOn(fileStorageService, "saveThumbnails").mockResolvedValue([]);
 
-    vi.spyOn(fileStorageService, "validateUniqueFilename").mockImplementation(async (filename: string) => {
-      if (uploadedFilenames.has(filename)) {
-        throw new ConflictException(
-          `A file named "${filename}" already exists in storage. Please rename the file, delete the existing file (ID: ${uploadedFilenames.get(filename)}), or choose a different name.`,
-          uploadedFilenames.get(filename),
-        );
-      }
-    });
+    vi.spyOn(fileStorageService, "validateUniqueFilename").mockImplementation(
+      async (filename: string, folderPath?: string | null) => {
+        const existingId = uploadedKeys.get(uniqKey(filename, folderPath));
+        if (existingId) {
+          const scope =
+            folderPath === undefined ? "in storage" : folderPath ? `in folder "${folderPath}"` : "in the root folder";
+          throw new ConflictException(
+            `A file named "${filename}" already exists ${scope}. Please rename the file, delete the existing file (ID: ${existingId}), or choose a different name.`,
+            existingId,
+          );
+        }
+      },
+    );
 
-    vi.spyOn(fileStorageService, "findDuplicateByOriginalFileName").mockImplementation(async (filename: string) => {
-      const existingFileId = uploadedFilenames.get(filename);
-      if (existingFileId) {
-        return {
-          fileStorageId: existingFileId,
-          metadata: { _originalFileName: filename },
-        };
-      }
-      return null;
-    });
+    vi.spyOn(fileStorageService, "findDuplicateByOriginalFileName").mockImplementation(
+      async (filename: string, folderPath?: string | null) => {
+        const existingId = uploadedKeys.get(uniqKey(filename, folderPath));
+        return existingId ? { fileStorageId: existingId, metadata: { _originalFileName: filename } } : null;
+      },
+    );
   });
 
   beforeEach(() => {
     uploadedFilenames.clear();
+    uploadedKeys.clear();
     mockFileIdCounter = 0;
   });
 
@@ -180,6 +199,35 @@ describe("FileStorageController", () => {
       expect(res2.body.error).toContain("already exists");
       expect(res2.body.error).toContain(filename);
       expect(res2.body.existingResourceId).toBeDefined();
+    });
+
+    it("allows the same filename in different folders (per-folder uniqueness)", async () => {
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/dirA" });
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/dirB" });
+
+      const r1 = await uploadFileTo("same-name.gcode", SIMPLE_GCODE, "/dirA");
+      expectOkResponse(r1);
+      const r2 = await uploadFileTo("same-name.gcode", SIMPLE_GCODE, "/dirB");
+      expectOkResponse(r2);
+    });
+
+    it("rejects the same filename within the same folder", async () => {
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/dirC" });
+
+      const r1 = await uploadFileTo("dup-in-folder.gcode", SIMPLE_GCODE, "/dirC");
+      expectOkResponse(r1);
+      const r2 = await uploadFileTo("dup-in-folder.gcode", "G28\nG1 X5 Y5\n", "/dirC");
+      expect(r2.status).toBe(409);
+      expect(r2.body.error).toContain('folder "/dirC"');
+    });
+
+    it("a name used in a subfolder doesn't block the same name at root", async () => {
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/dirD" });
+
+      const r1 = await uploadFileTo("root-vs-folder.gcode", SIMPLE_GCODE, "/dirD");
+      expectOkResponse(r1);
+      const r2 = await uploadFile("root-vs-folder.gcode", SIMPLE_GCODE);
+      expectOkResponse(r2);
     });
 
     it("should accept .3mf files", async () => {

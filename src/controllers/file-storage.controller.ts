@@ -368,7 +368,6 @@ export class FileStorageController {
     }
 
     const file = files[0];
-    await this.fileStorageService.validateUniqueFilename(file.originalname);
 
     // Optional folder destination — accepted as form field alongside the file.
     const rawFolderPath = typeof req.body?.folderPath === "string" ? req.body.folderPath : null;
@@ -376,6 +375,10 @@ export class FileStorageController {
     if (folderPath && !(await this.fileStorageFolderService.findByPath(folderPath))) {
       throw new BadRequestException(`Folder ${folderPath} doesn't exist — create it before uploading into it`);
     }
+
+    // Uniqueness is scoped to the destination folder, so the same filename can
+    // live in different folders (needed for bulk/folder uploads).
+    await this.fileStorageService.validateUniqueFilename(file.originalname, folderPath);
 
     const ext = extname(file.originalname);
     const tempPathWithExt = file.path + ext;

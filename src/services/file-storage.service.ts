@@ -18,7 +18,7 @@ export interface IFileStorageService {
   getFilePath(fileStorageId: string): string;
   getFileSize(fileStorageId: string): number;
   calculateFileHash(filePath: string): Promise<string>;
-  validateUniqueFilename(fileName: string): Promise<void>;
+  validateUniqueFilename(fileName: string, folderPath?: string | null): Promise<void>;
   saveMetadata(
     fileStorageId: string,
     metadata: any,
@@ -32,7 +32,10 @@ export interface IFileStorageService {
   loadMetadata(fileStorageId: string): Promise<any | null>;
   hasMetadata(fileStorageId: string): Promise<boolean>;
   getDeterministicId(fileHash: string, fileName: string): string;
-  findDuplicateByOriginalFileName(originalFileName: string): Promise<{ fileStorageId: string; metadata: any } | null>;
+  findDuplicateByOriginalFileName(
+    originalFileName: string,
+    folderPath?: string | null,
+  ): Promise<{ fileStorageId: string; metadata: any } | null>;
   saveThumbnails(
     fileStorageId: string,
     thumbnails: Array<{ data?: string; format?: string; width?: number; height?: number }>,
@@ -92,11 +95,19 @@ export class FileStorageService implements IFileStorageService {
     return stats.size;
   }
 
-  async validateUniqueFilename(fileName: string): Promise<void> {
-    const existing = await this.findDuplicateByOriginalFileName(fileName);
+  /**
+   * Reject a filename that already exists. When `folderPath` is supplied the
+   * check is scoped to that folder (so the same name may live in different
+   * folders — required for bulk/folder uploads); omitting it keeps the legacy
+   * storage-wide check.
+   */
+  async validateUniqueFilename(fileName: string, folderPath?: string | null): Promise<void> {
+    const existing = await this.findDuplicateByOriginalFileName(fileName, folderPath);
     if (existing) {
+      const scope =
+        folderPath === undefined ? "in storage" : folderPath ? `in folder "${folderPath}"` : "in the root folder";
       throw new ConflictException(
-        `A file named "${fileName}" already exists in storage. Please rename the file, delete the existing file (ID: ${existing.fileStorageId}), or choose a different name.`,
+        `A file named "${fileName}" already exists ${scope}. Please rename the file, delete the existing file (ID: ${existing.fileStorageId}), or choose a different name.`,
         existing.fileStorageId,
       );
     }
@@ -226,10 +237,19 @@ export class FileStorageService implements IFileStorageService {
     });
   }
 
-  async findDuplicateByOriginalFileName(originalFileName: string): Promise<{
+  async findDuplicateByOriginalFileName(
+    originalFileName: string,
+    folderPath?: string | null,
+  ): Promise<{
     fileStorageId: string;
     metadata: any;
   } | null> {
+    // When a folderPath is passed (including `null` for root), only a same-name
+    // file in *that* folder counts as a duplicate. When it's omitted the check
+    // stays storage-wide (legacy behaviour).
+    const scopeToFolder = folderPath !== undefined;
+    const targetFolder = folderPath ?? null;
+
     for (const subdir of this.STORAGE_SUBDIRS) {
       const dirPath = join(this.storageBasePath, subdir);
       try {
@@ -241,12 +261,13 @@ export class FileStorageService implements IFileStorageService {
           const fileId = path.parse(file).name;
           const metadata = await this.loadMetadata(fileId);
 
-          if (metadata?._originalFileName === originalFileName) {
-            return {
-              fileStorageId: fileId,
-              metadata,
-            };
-          }
+          if (metadata?._originalFileName !== originalFileName) continue;
+          if (scopeToFolder && (metadata?._folderPath ?? null) !== targetFolder) continue;
+
+          return {
+            fileStorageId: fileId,
+            metadata,
+          };
         }
       } catch (error) {
         this.logger.error(`Error searching for duplicate in ${subdir}`, error);
