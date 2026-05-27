@@ -425,20 +425,42 @@ export class PrusaLinkApi implements IPrinterApi {
     action: "pause" | "resume" | "cancel",
     callV1: (jobId: number) => Promise<unknown>,
   ): Promise<void> {
-    const jobId = await this.getCurrentJobId();
+    const status = await this.getStatus();
+    const jobId = status.job?.id;
+    // States where a job is genuinely in flight. Buddy can drop status.job.id
+    // mid-ATTENTION (filament runout, calibration), so those still count as
+    // actionable even without an id.
+    const activeStates = new Set(["PRINTING", "PAUSED", "PAUSING", "BUSY", "ATTENTION"]);
+    const isActive = activeStates.has((status.printer?.state ?? "").toUpperCase());
+
     if (jobId) {
       try {
         await callV1(jobId);
         return;
       } catch (err) {
-        const status = (err as AxiosError)?.response?.status;
+        const httpStatus = (err as AxiosError)?.response?.status;
         // Only fall back when the v1 endpoint actually rejected this specific
         // command — network errors and 401s should still surface.
-        if (status !== 404 && status !== 409 && status !== 405) throw err;
-        this.logger.warn(`PrusaLink v1 ${action} returned ${status}; trying OctoPrint-compat fallback`, this.logMeta());
+        if (httpStatus !== 404 && httpStatus !== 409 && httpStatus !== 405) throw err;
+        this.logger.warn(
+          `PrusaLink v1 ${action} returned ${httpStatus}; trying OctoPrint-compat fallback`,
+          this.logMeta(),
+        );
       }
+    } else if (!isActive) {
+      // No job id and the printer is idle/finished — there's nothing to control.
+      // Reject clearly instead of firing the legacy command, which some firmware
+      // (the MK3's standalone PrusaLink) accepts as a silent no-op even when no
+      // print is running.
+      throw new ExternalServiceError(
+        { error: `No active print to ${action}.`, statusCode: 409, success: false },
+        "Prusa-Link",
+      );
     }
 
+    // Legacy OctoPrint-compat fallback: reached either after a v1 failure (job
+    // known to exist) or when status.job.id is missing but the printer is in an
+    // active/ATTENTION state where Buddy hides the id.
     const legacyCommand = action === "cancel" ? "cancel" : action;
     try {
       await this.client.post<void>("/api/job", { command: legacyCommand });
@@ -858,11 +880,6 @@ export class PrusaLinkApi implements IPrinterApi {
 
   private getFileRaw(path: string, storage: string) {
     return this.client.get<PL_FileDto>(`/api/v1/files/${storage}/${path}`);
-  }
-
-  private async getCurrentJobId() {
-    const status = await this.getStatus();
-    return status.job?.id;
   }
 
   /**
