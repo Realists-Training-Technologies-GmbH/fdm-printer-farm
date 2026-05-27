@@ -248,8 +248,7 @@ export class PrinterEventsCache extends KeyDiffCache<PrinterEventsCacheDto> {
       // that Buddy returns in `file.path`. All subsequent
       // markStarted / markProgress / markFinished calls in this handler
       // use the same `filename`, so they stay consistent.
-      const filename =
-        payload?.job?.file?.display ?? payload?.job?.file?.name ?? payload?.job?.file?.path;
+      const filename = payload?.job?.file?.display ?? payload?.job?.file?.name ?? payload?.job?.file?.path;
       const completion = payload?.progress?.completion;
       if (stateUpper === "PRINTING" && filename) {
         const printerName = await this.getPrinterName(printerId);
@@ -276,21 +275,12 @@ export class PrinterEventsCache extends KeyDiffCache<PrinterEventsCacheDto> {
         if (job) {
           await this.printerThumbnailCache.handleJobCompleted(printerId, job.id);
         }
-      } else if (
-        (stateUpper === "STOPPED" ||
-          stateUpper === "CANCELLING" ||
-          flags?.cancelling) &&
-        filename
-      ) {
+      } else if ((stateUpper === "STOPPED" || stateUpper === "CANCELLING" || flags?.cancelling) && filename) {
         // STOPPED is PrusaLink's "user cancelled" terminal state. Match
         // the controller's cancel path so the job ends up as CANCELLED
         // instead of FAILED.
         await this.printJobService.handlePrintCancelled(printerId, stateText ?? "Cancelled");
-      } else if (
-        (stateUpper === "ERROR" || flags?.error) &&
-        !stateUpper.startsWith("ATTENTION") &&
-        filename
-      ) {
+      } else if ((stateUpper === "ERROR" || flags?.error) && !stateUpper.startsWith("ATTENTION") && filename) {
         await this.printJobService.markFailed(printerId, filename, stateText ?? "Error");
       }
     }

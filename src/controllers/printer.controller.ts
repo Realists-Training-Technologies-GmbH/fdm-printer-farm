@@ -285,10 +285,7 @@ export class PrinterController {
    * printer command already succeeded, and the polling loop will
    * reconcile on its own if the immediate write fails.
    */
-  private async syncJobStatusAfterAction(
-    req: Request,
-    action: "pause" | "resume" | "cancel",
-  ): Promise<void> {
+  private async syncJobStatusAfterAction(req: Request, action: "pause" | "resume" | "cancel"): Promise<void> {
     try {
       const { currentPrinterId } = getScopedPrinter(req);
       if (action === "pause") {
