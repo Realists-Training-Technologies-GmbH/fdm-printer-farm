@@ -746,13 +746,48 @@ export class PrusaLinkApi implements IPrinterApi {
   async deleteFile(path: string): Promise<void> {
     const storage = await this.getInternalStorage();
     const resolved = await this.resolveEncodedPath(path, storage);
-    await this.client.delete<void>(`/api/v1/files/${storage}/${resolved}`);
+    try {
+      await this.client.delete<void>(`/api/v1/files/${storage}/${resolved}`);
+    } catch (e) {
+      this.throwDeleteError(e, "file");
+    }
   }
 
   async deleteFolder(path: string): Promise<void> {
     const storage = await this.getInternalStorage();
     const resolved = await this.resolveEncodedPath(path, storage);
-    await this.client.delete<void>(`/api/v1/files/${storage}/${resolved}`);
+    try {
+      await this.client.delete<void>(`/api/v1/files/${storage}/${resolved}`);
+    } catch (e) {
+      this.throwDeleteError(e, "folder");
+    }
+  }
+
+  /**
+   * Translate a delete failure into an actionable error. PrusaLink answers
+   * `409 Conflict` when the target is **in use** — not just when it's being
+   * printed, but also when the file is "open" on the printer (the Buddy print
+   * preview / confirm screen selects the file, and a selected file can't be
+   * deleted until it's deselected or the preview is cancelled). That state is
+   * NOT visible in `/api/v1/status` or `/api/v1/job`, so the 409 is the only
+   * signal — surface it as a clear instruction instead of a raw HTTP error.
+   */
+  private throwDeleteError(e: unknown, kind: "file" | "folder"): never {
+    const status = (e as AxiosError)?.response?.status;
+    if (status === 409) {
+      throw new ExternalServiceError(
+        {
+          error:
+            kind === "file"
+              ? "PrusaLink won't delete this file because it's in use — it's either printing or open in the print preview on the printer. Cancel or deselect it on the printer screen, then try again."
+              : "PrusaLink won't delete this folder because a file inside it is in use — it's either printing or open in the print preview. Cancel or deselect it on the printer screen, then try again.",
+          statusCode: 409,
+          success: false,
+        },
+        "Prusa-Link",
+      );
+    }
+    throw e;
   }
 
   /**
