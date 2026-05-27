@@ -793,17 +793,17 @@ export class PrusaLinkApi implements IPrinterApi {
 
   /**
    * Stream the firmware-stored thumbnail for a file. We hit `/api/v1/files/<storage>/<path>`
-   * first to read the `refs.thumbnailSmall|thumbnailBig` URL the printer
-   * advertises, then stream that URL back. Falling back to the small variant
-   * when the big one isn't published keeps the call useful on every firmware.
+   * first to read the `refs.icon` (small) / `refs.thumbnail` (big) URL the
+   * printer advertises, then stream that URL back. Some firmwares publish only
+   * the big one (the small `icon` path can 404), so we fall back across both
+   * to keep the call useful on every firmware.
    */
   async getFileThumbnail(path: string, variant: "small" | "big" = "big"): AxiosPromise<NodeJS.ReadableStream> {
     const storage = await this.getInternalStorage();
     const resolved = await this.resolveEncodedPath(path, storage);
     const file = await this.getFileRaw(resolved, storage);
-    const refs = file.data?.refs as { thumbnailSmall?: string; thumbnailBig?: string } | undefined;
-    const url =
-      (variant === "big" ? refs?.thumbnailBig : refs?.thumbnailSmall) ?? refs?.thumbnailSmall ?? refs?.thumbnailBig;
+    const refs = file.data?.refs as { icon?: string | null; thumbnail?: string | null } | undefined;
+    const url = (variant === "big" ? refs?.thumbnail : refs?.icon) ?? refs?.thumbnail ?? refs?.icon;
     if (!url) {
       throw new ExternalServiceError(
         {

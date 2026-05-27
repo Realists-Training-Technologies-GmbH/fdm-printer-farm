@@ -31,8 +31,10 @@ export interface ChildDto {
 }
 
 export interface RefsDto {
-  resource: string;
-  thumbnailSmall: string;
-  thumbnailBig: string;
+  // PrusaLink Web API `PrintFileRefs`: `icon` is the small (~16-24px)
+  // thumbnail, `thumbnail` the big (~220px) one. Both may be null/absent
+  // (e.g. plain .gcode sliced without thumbnails, or the legacy Einsy shim).
+  icon?: string | null;
+  thumbnail?: string | null;
   download: string;
 }
