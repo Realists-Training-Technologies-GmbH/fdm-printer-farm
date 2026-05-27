@@ -81,6 +81,10 @@ describe("FileStorageController", () => {
   });
 
   beforeEach(() => {
+    // Reset spy call history between tests (implementations from beforeAll are
+    // preserved). Without this, per-test spies like deleteFile accumulate calls
+    // across tests and cross-contaminate assertions.
+    vi.clearAllMocks();
     uploadedFilenames.clear();
     uploadedKeys.clear();
     mockFileIdCounter = 0;
@@ -158,6 +162,54 @@ describe("FileStorageController", () => {
       const res = await testRequest.delete(`${baseRoute}/file-123`);
       expectOkResponse(res);
       expect(fileStorageService.deleteFile).toHaveBeenCalledWith("file-123");
+    });
+  });
+
+  describe("DELETE /api/file-storage/folders - Delete folder", () => {
+    it("deleteFiles=true permanently deletes every file in the subtree (rm -rf)", async () => {
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/delA" });
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/delA/sub" });
+      vi.spyOn(fileStorageService, "listAllFiles").mockResolvedValue([
+        { fileStorageId: "f-1", metadata: { _folderPath: "/delA" } },
+        { fileStorageId: "f-2", metadata: { _folderPath: "/delA/sub" } },
+        { fileStorageId: "f-root", metadata: { _folderPath: null } },
+      ] as any);
+      const del = vi.spyOn(fileStorageService, "deleteFile").mockResolvedValue(undefined);
+      const move = vi.spyOn(fileStorageService, "setFolderPath").mockResolvedValue(undefined);
+
+      const res = await testRequest.delete(`${baseRoute}/folders?path=/delA&deleteFiles=true&force=true`);
+      expectOkResponse(res);
+      expect(del).toHaveBeenCalledWith("f-1");
+      expect(del).toHaveBeenCalledWith("f-2");
+      expect(del).not.toHaveBeenCalledWith("f-root");
+      expect(move).not.toHaveBeenCalled();
+      expect(res.body.filesDeleted).toBe(2);
+    });
+
+    it("cascade=true moves files to root instead of deleting them", async () => {
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/delB" });
+      vi.spyOn(fileStorageService, "listAllFiles").mockResolvedValue([
+        { fileStorageId: "g-1", metadata: { _folderPath: "/delB" } },
+      ] as any);
+      const del = vi.spyOn(fileStorageService, "deleteFile").mockResolvedValue(undefined);
+      const move = vi.spyOn(fileStorageService, "setFolderPath").mockResolvedValue(undefined);
+
+      const res = await testRequest.delete(`${baseRoute}/folders?path=/delB&cascade=true&force=true`);
+      expectOkResponse(res);
+      expect(move).toHaveBeenCalledWith("g-1", null);
+      expect(del).not.toHaveBeenCalled();
+      expect(res.body.filesMovedToRoot).toBe(1);
+    });
+
+    it("409 when the folder has files and neither cascade nor deleteFiles is set", async () => {
+      await testRequest.post(`${baseRoute}/folders`).send({ path: "/delC" });
+      vi.spyOn(fileStorageService, "listAllFiles").mockResolvedValue([
+        { fileStorageId: "h-1", metadata: { _folderPath: "/delC" } },
+      ] as any);
+
+      const res = await testRequest.delete(`${baseRoute}/folders?path=/delC`);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("deleteFiles=true");
     });
   });
 
@@ -269,6 +321,61 @@ describe("FileStorageController", () => {
       expectOkResponse(res);
       expect(res.body).toHaveProperty("thumbnailCount");
       expect(typeof res.body.thumbnailCount).toBe("number");
+    });
+  });
+
+  describe("PATCH /api/file-storage/:id/folder - Move file (per-folder uniqueness)", () => {
+    it("409 when moving a file into a folder that already has that name", async () => {
+      uploadedKeys.set(uniqKey("clash.gcode", null), "existing-id");
+      vi.spyOn(fileStorageService, "fileExists").mockResolvedValue(true);
+      vi.spyOn(fileStorageService, "loadMetadata").mockResolvedValue({ _originalFileName: "clash.gcode" });
+      const set = vi.spyOn(fileStorageService, "setFolderPath").mockResolvedValue(undefined);
+
+      const res = await testRequest.patch(`${baseRoute}/other-id/folder`).send({ folderPath: null });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("already exists");
+      expect(set).not.toHaveBeenCalled();
+    });
+
+    it("allows the move when there's no name clash in the destination", async () => {
+      vi.spyOn(fileStorageService, "fileExists").mockResolvedValue(true);
+      vi.spyOn(fileStorageService, "loadMetadata").mockResolvedValue({ _originalFileName: "unique.gcode" });
+      const set = vi.spyOn(fileStorageService, "setFolderPath").mockResolvedValue(undefined);
+
+      const res = await testRequest.patch(`${baseRoute}/some-id/folder`).send({ folderPath: null });
+      expectOkResponse(res);
+      expect(set).toHaveBeenCalledWith("some-id", null);
+    });
+
+    it("allows re-saving a file into the folder it's already in (no self-clash)", async () => {
+      uploadedKeys.set(uniqKey("self.gcode", null), "self-id");
+      vi.spyOn(fileStorageService, "fileExists").mockResolvedValue(true);
+      vi.spyOn(fileStorageService, "loadMetadata").mockResolvedValue({ _originalFileName: "self.gcode" });
+      const set = vi.spyOn(fileStorageService, "setFolderPath").mockResolvedValue(undefined);
+
+      const res = await testRequest.patch(`${baseRoute}/self-id/folder`).send({ folderPath: null });
+      expectOkResponse(res);
+      expect(set).toHaveBeenCalledWith("self-id", null);
+    });
+  });
+
+  describe("getDeterministicId - folder-scoped storage ids", () => {
+    it("gives the same name+content in different folders distinct ids (no overwrite)", () => {
+      const root = fileStorageService.getDeterministicId("hashX", "foo.gcode", null);
+      const inFolder = fileStorageService.getDeterministicId("hashX", "foo.gcode", "/Bauteile");
+      expect(root).not.toBe(inFolder);
+    });
+
+    it("is backward-compatible at root (folderPath null === omitted)", () => {
+      const withNull = fileStorageService.getDeterministicId("hashX", "foo.gcode", null);
+      const legacy = fileStorageService.getDeterministicId("hashX", "foo.gcode");
+      expect(withNull).toBe(legacy);
+    });
+
+    it("is stable for the same content+name+folder", () => {
+      const a = fileStorageService.getDeterministicId("hashX", "foo.gcode", "/X");
+      const b = fileStorageService.getDeterministicId("hashX", "foo.gcode", "/X");
+      expect(a).toBe(b);
     });
   });
 
