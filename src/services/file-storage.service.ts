@@ -12,7 +12,7 @@ import { Readable } from "node:stream";
 import { ConflictException } from "@/exceptions/runtime.exceptions";
 
 export interface IFileStorageService {
-  saveFile(file: Express.Multer.File, fileHash?: string): Promise<string>;
+  saveFile(file: Express.Multer.File, fileHash?: string, folderPath?: string | null): Promise<string>;
   getFile(fileStorageId: string): Promise<Buffer>;
   deleteFile(fileStorageId: string): Promise<void>;
   getFilePath(fileStorageId: string): string;
@@ -31,7 +31,7 @@ export interface IFileStorageService {
   moveFilesToFolder(sourceFolderPath: string, destinationFolderPath: string | null): Promise<number>;
   loadMetadata(fileStorageId: string): Promise<any | null>;
   hasMetadata(fileStorageId: string): Promise<boolean>;
-  getDeterministicId(fileHash: string, fileName: string): string;
+  getDeterministicId(fileHash: string, fileName: string, folderPath?: string | null): string;
   findDuplicateByOriginalFileName(
     originalFileName: string,
     folderPath?: string | null,
@@ -113,19 +113,8 @@ export class FileStorageService implements IFileStorageService {
     }
   }
 
-  async saveFile(file: Express.Multer.File, fileHash?: string): Promise<string> {
+  async saveFile(file: Express.Multer.File, fileHash?: string, folderPath?: string | null): Promise<string> {
     const fileExt = extname(file.originalname).toLowerCase();
-
-    let fileId: string;
-    if (fileHash) {
-      const nameHash = createHash("sha256")
-        .update(fileHash + file.originalname)
-        .digest("hex")
-        .substring(0, 32);
-      fileId = `${nameHash.substring(0, 8)}-${nameHash.substring(8, 12)}-${nameHash.substring(12, 16)}-${nameHash.substring(16, 20)}-${nameHash.substring(20, 32)}`;
-    } else {
-      fileId = crypto.randomUUID();
-    }
 
     let subdir = "gcode";
     if (fileExt === ".3mf" || file.originalname.includes(".gcode.3mf")) {
@@ -133,8 +122,27 @@ export class FileStorageService implements IFileStorageService {
     } else if (fileExt === ".bgcode") {
       subdir = "bgcode";
     }
-
     const targetDir = join(this.storageBasePath, subdir);
+
+    // Deterministic per (content, name, folder) so the same file in different
+    // folders gets distinct storage ids — otherwise a same-name+same-content
+    // upload into another folder overwrites the existing one on disk.
+    let fileId = fileHash ? this.getDeterministicId(fileHash, file.originalname, folderPath) : crypto.randomUUID();
+
+    // A folder rename rewrites a file's `_folderPath` metadata but keeps its
+    // (old-folder-derived) storage id and on-disk name. So re-uploading the
+    // original file to its *old* path recomputes that same id — which would
+    // clobber the moved file's metadata and lose it. Guard: if this id is
+    // already taken by a file that now lives in a different folder, mint a
+    // fresh id instead of overwriting it. Read the would-be metadata path
+    // directly (O(1)) — loadMetadata would re-scan every storage dir per upload.
+    if (fileHash) {
+      const existingMeta = await this.readMetadataAtPath(join(targetDir, `${fileId}${fileExt}`) + ".json");
+      if (existingMeta && (existingMeta._folderPath ?? null) !== (folderPath ?? null)) {
+        fileId = crypto.randomUUID();
+      }
+    }
+
     const targetPath = join(targetDir, `${fileId}${fileExt}`);
 
     if (file.path) {
@@ -202,9 +210,13 @@ export class FileStorageService implements IFileStorageService {
     return hashSum.digest("hex");
   }
 
-  getDeterministicId(fileHash: string, fileName: string): string {
+  getDeterministicId(fileHash: string, fileName: string, folderPath?: string | null): string {
+    // Include the folder so the same name+content in *different* folders gets
+    // distinct ids and doesn't overwrite each other on disk. Root resolves to
+    // "" — identical to the legacy `fileHash + fileName` scheme, so existing
+    // root files keep their ids.
     const nameHash = createHash("sha256")
-      .update(fileHash + fileName)
+      .update(fileHash + (folderPath ?? "") + fileName)
       .digest("hex")
       .substring(0, 32);
     return `${nameHash.substring(0, 8)}-${nameHash.substring(8, 12)}-${nameHash.substring(12, 16)}-${nameHash.substring(16, 20)}-${nameHash.substring(20, 32)}`;
@@ -259,7 +271,10 @@ export class FileStorageService implements IFileStorageService {
           if (file.endsWith("_thumbnails") || file.endsWith(".json")) continue;
 
           const fileId = path.parse(file).name;
-          const metadata = await this.loadMetadata(fileId);
+          // Read the sibling .json directly; loadMetadata() would re-scan every
+          // storage dir per file (findFilePath), making each upload's duplicate
+          // check O(N²) over the library.
+          const metadata = await this.readMetadataAtPath(join(dirPath, file) + ".json");
 
           if (metadata?._originalFileName !== originalFileName) continue;
           if (scopeToFolder && (metadata?._folderPath ?? null) !== targetFolder) continue;
@@ -526,35 +541,62 @@ export class FileStorageService implements IFileStorageService {
       const dirPath = join(this.storageBasePath, subdir);
       try {
         const dirFiles = await readdir(dirPath);
+        const entries = dirFiles.filter((f) => !f.endsWith("_thumbnails") && !f.endsWith(".json"));
 
-        for (const file of dirFiles) {
-          if (file.endsWith("_thumbnails") || file.endsWith(".json")) continue;
+        // Build each entry straight from the paths we already have. Calling
+        // loadMetadata()/listThumbnails() here would re-run findFilePath() — a
+        // readdir() scan of every storage dir per file — making the whole listing
+        // O(N²) and slow once the library grows. Reading the sibling .json and
+        // _thumbnails dir directly keeps it O(N); the per-file work runs in
+        // parallel within each subdir.
+        const built = await Promise.all(
+          entries.map(async (file) => {
+            const fileId = path.parse(file).name;
+            const filePath = join(dirPath, file);
+            const stats = await stat(filePath);
+            const metadata = await this.readMetadataAtPath(filePath + ".json");
+            const thumbnailCount = await this.countThumbnailsAtDir(
+              filePath.replace(/\.(gcode|3mf|bgcode)$/i, "_thumbnails"),
+            );
 
-          const fileId = path.parse(file).name;
-          const filePath = join(dirPath, file);
-          const stats = await stat(filePath);
-
-          const metadata = await this.loadMetadata(fileId);
-
-          const thumbnails = await this.listThumbnails(fileId);
-
-          files.push({
-            fileStorageId: fileId,
-            fileName: metadata?._fileName || file,
-            fileFormat: subdir,
-            fileSize: stats.size,
-            fileHash: metadata?._fileHash || "",
-            createdAt: stats.birthtime,
-            thumbnailCount: thumbnails.length,
-            metadata: metadata,
-          });
-        }
+            return {
+              fileStorageId: fileId,
+              fileName: metadata?._fileName || file,
+              fileFormat: subdir,
+              fileSize: stats.size,
+              fileHash: metadata?._fileHash || "",
+              createdAt: stats.birthtime,
+              thumbnailCount,
+              metadata,
+            };
+          }),
+        );
+        files.push(...built);
       } catch (error) {
         this.logger.error(`Error listing files in ${subdir}`, error);
       }
     }
 
     return files.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  /** Read & parse a metadata JSON at a known path. Null if missing/invalid. */
+  private async readMetadataAtPath(metadataPath: string): Promise<any | null> {
+    try {
+      return JSON.parse(await readFile(metadataPath, "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  /** Count thumbnail images in a known thumbnails dir. 0 if missing. */
+  private async countThumbnailsAtDir(thumbnailDir: string): Promise<number> {
+    try {
+      const thumbs = await readdir(thumbnailDir);
+      return thumbs.filter((f) => f.startsWith("thumb_")).length;
+    } catch {
+      return 0;
+    }
   }
 
   async getFileInfo(fileStorageId: string): Promise<{
