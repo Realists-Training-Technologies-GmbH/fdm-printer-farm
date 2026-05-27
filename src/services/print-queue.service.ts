@@ -14,6 +14,13 @@ import { captureException } from "@sentry/node";
 import { PrinterMaintenanceLogService } from "@/services/orm/printer-maintenance-log.service";
 import { BadRequestException } from "@/exceptions/runtime.exceptions";
 
+// Subfolder on the printer's own storage where File-Storage prints are uploaded.
+// Keeps print copies out of the printer's root and lets us clean them up: the
+// file from the previous print is deleted right before the next one is uploaded
+// (deleting at completion time is unreliable on PrusaLink, which keeps the
+// just-finished file "selected" and answers 409 until the user dismisses it).
+export const PRINTER_TEMP_FOLDER = "fdm-monster-temp";
+
 export interface QueuedJob {
   id: number;
   fileName: string;
@@ -66,6 +73,10 @@ export class PrintQueueService implements IPrintQueueService {
   printerRepository: Repository<Printer>;
   eventEmitter2: EventEmitter2;
   private readonly logger: LoggerService;
+  // Printer-side paths of temp files left by each printer's File-Storage prints,
+  // pending deletion. Cleared as each is deleted before a subsequent upload; a
+  // failed delete stays in the set and is retried on the next print.
+  private readonly pendingTempFiles = new Map<number, Set<string>>();
 
   constructor(
     loggerFactory: ILoggerFactory,
@@ -413,16 +424,44 @@ export class PrintQueueService implements IPrintQueueService {
         this.logger.log(`Starting print of USB file ${usbFilePath} on printer ${printerId}`);
         await printerApi.startPrint(encodedPath);
       } else if (fileStorageId) {
+        // Clean up temp files from this printer's previous print(s) before we
+        // upload the next one — by now the printer has moved on so they're no
+        // longer "selected"/in use and the delete succeeds.
+        await this.cleanupPendingTempFiles(printerApi, printerId);
+
+        // Ensure the temp folder exists (no-op if the printer type or firmware
+        // doesn't support folder creation).
+        if (typeof printerApi.createFolder === "function") {
+          try {
+            await printerApi.createFolder(PRINTER_TEMP_FOLDER);
+          } catch (e) {
+            this.logger.debug(
+              `Could not pre-create temp folder on printer ${printerId} (continuing): ${
+                e instanceof Error ? e.message : e
+              }`,
+            );
+          }
+        }
+
         const fileSize = this.fileStorageService.getFileSize(fileStorageId);
         const fileStream = this.fileStorageService.readFileStream(fileStorageId);
 
-        this.logger.log(`Uploading file ${fileName} to printer ${printerId} and starting print`);
+        this.logger.log(`Uploading file ${fileName} to printer ${printerId} (temp folder) and starting print`);
         await printerApi.uploadFile({
           stream: fileStream,
           fileName,
           contentLength: fileSize,
           startPrint: true,
+          targetPath: PRINTER_TEMP_FOLDER,
         });
+
+        // Remember where it landed so the next print can delete it.
+        let pending = this.pendingTempFiles.get(printerId);
+        if (!pending) {
+          pending = new Set<string>();
+          this.pendingTempFiles.set(printerId, pending);
+        }
+        pending.add(`${PRINTER_TEMP_FOLDER}/${fileName}`);
       } else {
         throw new Error(`Job ${jobId} has neither fileStorageId nor usbFilePath - cannot submit to printer`);
       }
@@ -454,6 +493,30 @@ export class PrintQueueService implements IPrintQueueService {
       }
 
       throw error;
+    }
+  }
+
+  /**
+   * Best-effort removal of temp files left on the printer by previous
+   * File-Storage prints. Never throws — a failure here must not block the new
+   * print; the path stays pending and is retried before the next print.
+   */
+  private async cleanupPendingTempFiles(printerApi: { deleteFile(path: string): Promise<void> }, printerId: number) {
+    const pending = this.pendingTempFiles.get(printerId);
+    if (!pending || pending.size === 0) return;
+
+    for (const path of [...pending]) {
+      try {
+        await printerApi.deleteFile(path);
+        pending.delete(path);
+        this.logger.log(`Deleted temp print file ${path} on printer ${printerId}`);
+      } catch (e) {
+        this.logger.warn(
+          `Could not delete temp print file ${path} on printer ${printerId} (will retry next print): ${
+            e instanceof Error ? e.message : e
+          }`,
+        );
+      }
     }
   }
 }
