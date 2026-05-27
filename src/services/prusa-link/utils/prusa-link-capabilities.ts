@@ -49,6 +49,8 @@ export interface PrusaLinkCapabilities {
   apiVersion: string | null;
   /** `version.server` — the PrusaLink server version string. */
   serverVersion: string | null;
+  /** Raw `version.text` (e.g. "PrusaLink XL"), kept for diagnostics/errors. */
+  versionText: string | null;
 }
 
 /**
@@ -85,6 +87,7 @@ export function deriveCapabilities(version: VersionDto | null | undefined): Prus
     fileExtensions,
     apiVersion: version?.api ?? null,
     serverVersion: version?.server ?? null,
+    versionText: modelInfo.raw,
   };
 }
 

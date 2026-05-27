@@ -26,7 +26,7 @@ import { ExternalServiceError } from "@/exceptions/runtime.exceptions";
 import EventEmitter2 from "eventemitter2";
 import type { PL_FileDto } from "@/services/prusa-link/dto/file.dto";
 import { SettingsStore } from "@/state/settings.store";
-import { deriveCapabilities } from "@/services/prusa-link/utils/prusa-link-capabilities";
+import { deriveCapabilities, type PrusaLinkCapabilities } from "@/services/prusa-link/utils/prusa-link-capabilities";
 import { apiKeyHeaderKey } from "@/services/octoprint/constants/octoprint-service.constants";
 
 const defaultLog = { adapter: "prusa-link" };
@@ -42,6 +42,9 @@ export class PrusaLinkApi implements IPrinterApi {
   // Memoized "internal printing storage" segment (see getInternalStorage).
   // A printer's storage layout is fixed, so resolve it once per instance.
   private internalStorageSegment: string | null = null;
+  // Memoized capability profile (see getCapabilities). Derived from
+  // /api/version, which doesn't change for a given printer/firmware.
+  private capabilities: PrusaLinkCapabilities | null = null;
 
   constructor(
     loggerFactory: ILoggerFactory,
@@ -86,6 +89,20 @@ export class PrusaLinkApi implements IPrinterApi {
   async getVersionInfo(): Promise<VersionDto> {
     const response = await this.client.get<VersionDto>("/api/version");
     return response.data;
+  }
+
+  /**
+   * Resolved capability profile for this printer — the single source of truth
+   * for the firmware divergences the adapter has to handle (bgcode support,
+   * upload transport, accepted file extensions, …). Derived from `/api/version`
+   * and memoized per instance, since a printer's firmware doesn't change.
+   */
+  async getCapabilities(): Promise<PrusaLinkCapabilities> {
+    if (this.capabilities) {
+      return this.capabilities;
+    }
+    this.capabilities = deriveCapabilities(await this.getVersionInfo());
+    return this.capabilities;
   }
 
   async validateConnection(): Promise<void> {
@@ -547,11 +564,10 @@ export class PrusaLinkApi implements IPrinterApi {
   async uploadFile(input: UploadFileInput): Promise<void> {
     const validated = uploadFileInputSchema.parse(input);
 
-    // Fetch the full /api/version payload up-front: it tells us the printer
-    // model (Buddy 32-bit vs Marlin 8-bit Einsy), which gates both `.bgcode`
-    // support and the upload transport chosen further down.
-    const versionInfo = await this.getVersionInfo();
-    const caps = deriveCapabilities(versionInfo);
+    // Resolve the capability profile up-front: it tells us the printer model
+    // (Buddy 32-bit vs Marlin 8-bit Einsy), which gates both `.bgcode` support
+    // and the upload transport chosen further down.
+    const caps = await this.getCapabilities();
 
     if (validated.fileName.toLowerCase().endsWith(".bgcode")) {
       if (caps.supportsBgcode === false) {
@@ -560,7 +576,7 @@ export class PrusaLinkApi implements IPrinterApi {
           {
             error: `Binary G-code (.bgcode) cannot be printed on ${label}. Re-slice as plain .gcode or use a Buddy-firmware printer (MK4, MK3.9, MK3.5, XL, MINI+, Core One).`,
             statusCode: 400,
-            data: { model: caps.model, versionText: versionInfo.text },
+            data: { model: caps.model, versionText: caps.versionText },
             success: false,
           },
           "Prusa-Link",

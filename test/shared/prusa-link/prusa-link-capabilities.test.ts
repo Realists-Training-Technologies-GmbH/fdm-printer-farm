@@ -1,5 +1,7 @@
 import { acceptsExtension, deriveCapabilities } from "@/services/prusa-link/utils/prusa-link-capabilities";
 import type { VersionDto } from "@/services/prusa-link/dto/version.dto";
+import { PrusaLinkApi } from "@/services/prusa-link/prusa-link.api";
+import EventEmitter2 from "eventemitter2";
 
 // Mirrors upstream Prusa-Link-Web's per-firmware capability flags, but derived
 // at runtime from /api/version. Locks the firmware-divergence decisions
@@ -76,5 +78,37 @@ describe("acceptsExtension", () => {
   it("MK3 rejects .bgcode but accepts .gcode", () => {
     expect(acceptsExtension(mk3, "part.bgcode")).toBe(false);
     expect(acceptsExtension(mk3, "part.gcode")).toBe(true);
+  });
+});
+
+describe("PrusaLinkApi.getCapabilities", () => {
+  const loggerStub = { log() {}, info() {}, debug() {}, warn() {}, error() {}, newDebug() {} };
+  const settingsStore = { getTimeoutSettings: () => ({ apiTimeout: 1000 }) } as any;
+
+  function makeApi() {
+    const api = new PrusaLinkApi(() => loggerStub as any, new EventEmitter2(), {} as any, settingsStore, {
+      printerURL: "http://prusa.test",
+      printerType: 2,
+      username: "maker",
+      password: "secret",
+    } as any);
+    const getVersionInfo = vi.spyOn(api as any, "getVersionInfo").mockResolvedValue(version({ text: "PrusaLink XL" }));
+    return { api, getVersionInfo };
+  }
+
+  it("derives the profile from /api/version", async () => {
+    const { api } = makeApi();
+    const caps = await api.getCapabilities();
+    expect(caps.model).toBe("XL");
+    expect(caps.uploadTransport).toBe("put");
+    expect(caps.versionText).toBe("PrusaLink XL");
+  });
+
+  it("memoizes: /api/version is fetched once across repeated calls", async () => {
+    const { api, getVersionInfo } = makeApi();
+    await api.getCapabilities();
+    await api.getCapabilities();
+    await api.getCapabilities();
+    expect(getVersionInfo).toHaveBeenCalledTimes(1);
   });
 });
