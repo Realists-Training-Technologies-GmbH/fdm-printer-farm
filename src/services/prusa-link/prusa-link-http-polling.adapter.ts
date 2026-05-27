@@ -155,7 +155,13 @@ export class PrusaLinkHttpPollingAdapter implements IWebsocketAdapter {
       this.updateApiState(API_STATE.responding);
       this.consecutiveAuthFailures = 0;
 
-      const linkState = printerState.state?.flags?.link_state;
+      // Native/Buddy PrusaLink (XL, MK4, …) does NOT emit `link_state` on
+      // /api/printer — it carries the live state on /api/v1/status instead.
+      // The legacy Einsy shim (MK3/MK2.5) emits `link_state`. Fall back to the
+      // v1 status state so the flag mapping below works on every firmware;
+      // without this the XL's flags get clobbered to all-false (e.g.
+      // ready:false while idle, printing:false mid-print).
+      const linkState = printerState.state?.flags?.link_state ?? status?.printer?.state;
       const attentionMessage = status?.printer?.status_printer?.message;
       if (linkState && linkState !== "PRINTING") {
         // When the printer is in ATTENTION, surface the firmware's reason
